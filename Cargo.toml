@@ -15,4 +15,11 @@ categories = ["data-structures", "hardware-support", "mathematics"]
 opencl = ["ha-ndarray/opencl"]
 
 [dependencies]
+async-trait = "0.1"
+derive_more = "0.99"
+destream = { path = "../destream" }
+freqfs = { path = "../freqfs", features = ["stream"] }
+futures = "0.3"
 ha-ndarray = { path = "../ha-ndarray" }
+num_cpus = "1.15"
+safecast = { path = "../safecast" }
