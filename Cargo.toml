@@ -16,10 +16,12 @@ opencl = ["ha-ndarray/opencl"]
 
 [dependencies]
 async-trait = "0.1"
+b-table = { path = "../b-table", features = ["stream"] }
 derive_more = "0.99"
 destream = { path = "../destream" }
 freqfs = { path = "../freqfs", features = ["stream"] }
 futures = "0.3"
 ha-ndarray = { path = "../ha-ndarray" }
+number-general = { path = "../number-general", features = ["stream"] }
 num_cpus = "1.15"
 safecast = { path = "../safecast" }
