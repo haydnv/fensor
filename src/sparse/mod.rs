@@ -1,9 +1,11 @@
 use std::marker::PhantomData;
+use std::pin::Pin;
 use std::{fmt, io};
 
 use async_trait::async_trait;
 use b_table::{Range, TableLock};
-use futures::{Stream, TryStreamExt};
+use freqfs::DirLock;
+use futures::stream::{Stream, TryStreamExt};
 use ha_ndarray::CDatatype;
 use number_general::{DType, Number, NumberCollator, NumberType};
 use safecast::{AsType, CastInto};
@@ -19,6 +21,12 @@ pub type Node = b_table::b_tree::Node<Vec<Vec<Number>>>;
 #[derive(Clone, Eq, PartialEq)]
 pub struct IndexSchema {
     columns: Vec<usize>,
+}
+
+impl IndexSchema {
+    pub fn new(columns: Vec<usize>) -> Self {
+        Self { columns }
+    }
 }
 
 impl b_table::b_tree::Schema for IndexSchema {
@@ -70,6 +78,32 @@ pub struct Schema {
     primary: IndexSchema,
     auxiliary: Vec<(String, IndexSchema)>,
     shape: Shape,
+}
+
+impl Schema {
+    pub fn new(shape: Shape) -> Self {
+        let primary = IndexSchema::new((0..shape.len() + 1).into_iter().collect());
+        let mut auxiliary = Vec::with_capacity(shape.len());
+        for x in 0..shape.len() {
+            let mut columns = Vec::with_capacity(shape.len());
+            columns.push(x);
+
+            for xo in 0..shape.len() {
+                if xo != x {
+                    columns.push(xo);
+                }
+            }
+
+            let index_schema = IndexSchema::new(columns);
+            auxiliary.push((x.to_string(), index_schema));
+        }
+
+        Self {
+            primary,
+            auxiliary,
+            shape,
+        }
+    }
 }
 
 impl b_table::Schema for Schema {
@@ -128,12 +162,12 @@ impl fmt::Debug for Schema {
 }
 
 #[async_trait]
-pub trait SparseInstance {
+pub trait SparseInstance: TensorInstance {
     type DType;
 
     async fn elements(
         self,
-    ) -> Result<Box<dyn Stream<Item = Result<(Coord, Self::DType), Error>>>, Error>;
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<(Coord, Self::DType), Error>>>>, Error>;
 }
 
 pub struct SparseTable<FE, T> {
@@ -141,7 +175,33 @@ pub struct SparseTable<FE, T> {
     dtype: PhantomData<T>,
 }
 
-impl<FE, T: DType> TensorInstance for SparseTable<FE, T> {
+impl<FE, T> Clone for SparseTable<FE, T> {
+    fn clone(&self) -> Self {
+        Self {
+            table: self.table.clone(),
+            dtype: PhantomData,
+        }
+    }
+}
+
+impl<FE: AsType<Node> + Send + Sync, T> SparseTable<FE, T> {
+    pub async fn create(dir: DirLock<FE>, shape: Shape) -> Result<Self, Error> {
+        let schema = Schema::new(shape);
+        let collator = NumberCollator::default();
+        let table = TableLock::create(schema, collator, dir)?;
+
+        Ok(Self {
+            table,
+            dtype: PhantomData,
+        })
+    }
+}
+
+impl<FE, T> TensorInstance for SparseTable<FE, T>
+where
+    FE: Send + Sync + 'static,
+    T: DType + Send + Sync + 'static,
+{
     fn dtype(&self) -> NumberType {
         T::dtype()
     }
@@ -162,10 +222,10 @@ where
 
     async fn elements(
         self,
-    ) -> Result<Box<dyn Stream<Item = Result<(Coord, Self::DType), Error>>>, Error> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<(Coord, Self::DType), Error>>>>, Error> {
         let rows = self.table.rows(Range::default(), &[], false).await?;
         let elements = rows.map_ok(|row| unwrap_row(row)).map_err(Error::from);
-        Ok(Box::new(elements))
+        Ok(Box::pin(elements))
     }
 }
 

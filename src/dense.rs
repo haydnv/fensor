@@ -114,7 +114,22 @@ pub struct DenseFile<FE, T> {
     dtype: PhantomData<T>,
 }
 
-impl<FE, T: DType> TensorInstance for DenseFile<FE, T> {
+impl<FE, T> Clone for DenseFile<FE, T> {
+    fn clone(&self) -> Self {
+        Self {
+            axis: self.axis,
+            shape: self.shape.to_vec(),
+            blocks: self.blocks.clone(),
+            dtype: PhantomData,
+        }
+    }
+}
+
+impl<FE, T> TensorInstance for DenseFile<FE, T>
+where
+    FE: Send + Sync + 'static,
+    T: DType + Send + Sync + 'static,
+{
     fn dtype(&self) -> NumberType {
         T::dtype()
     }

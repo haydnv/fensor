@@ -13,6 +13,7 @@ pub struct Bounds(Vec<AxisBound>);
 
 #[derive(Debug, Display)]
 pub enum Error {
+    Bounds(String),
     IO(std::io::Error),
     Math(ha_ndarray::Error),
 }
@@ -31,7 +32,7 @@ impl From<ha_ndarray::Error> for Error {
     }
 }
 
-pub trait TensorInstance {
+pub trait TensorInstance: Clone + Send + Sync + 'static {
     fn dtype(&self) -> NumberType;
 
     fn ndim(&self) -> usize {
