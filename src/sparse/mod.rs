@@ -10,6 +10,8 @@ use safecast::{AsType, CastInto};
 
 use super::{Coord, Error};
 
+mod stream;
+
 const BLOCK_SIZE: usize = 4_096;
 
 pub type Node = b_table::b_tree::Node<Vec<Vec<Number>>>;
@@ -98,7 +100,7 @@ impl b_table::Schema for Schema {
     }
 
     fn validate_key(&self, key: Vec<Self::Value>) -> Result<Vec<Self::Value>, Self::Error> {
-        if key.len() == 1 {
+        if key.len() == self.ndim() {
             Ok(key)
         } else {
             let cause = io::Error::new(
@@ -111,7 +113,7 @@ impl b_table::Schema for Schema {
     }
 
     fn validate_values(&self, values: Vec<Self::Value>) -> Result<Vec<Self::Value>, Self::Error> {
-        if values.len() == 3 {
+        if values.len() == 1 {
             Ok(values)
         } else {
             let cause = io::Error::new(
@@ -145,8 +147,10 @@ pub struct SparseTable<FE, T> {
 }
 
 #[async_trait]
-impl<FE: AsType<Node> + Send + Sync + 'static, T: CDatatype> SparseAccessor for SparseTable<FE, T>
+impl<FE, T> SparseAccessor for SparseTable<FE, T>
 where
+    FE: AsType<Node> + Send + Sync + 'static,
+    T: CDatatype,
     Number: CastInto<T>,
 {
     type DType = T;
