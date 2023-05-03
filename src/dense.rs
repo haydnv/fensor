@@ -5,9 +5,10 @@ use destream::de;
 use freqfs::{DirLock, FileLoad};
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use ha_ndarray::*;
+use number_general::{DType, NumberType};
 use safecast::AsType;
 
-use super::Error;
+use super::{Error, Shape, TensorInstance};
 
 const IDEAL_BLOCK_SIZE: usize = 65_536;
 
@@ -100,7 +101,7 @@ decode_array!(f32, "32-bit int array", decode_array_f32, visit_array_f32);
 decode_array!(f64, "64-bit int array", decode_array_f64, visit_array_f64);
 
 #[async_trait]
-trait DenseAccessor {
+trait DenseInstance {
     type Block: NDArrayRead;
 
     async fn blocks(self) -> Result<Box<dyn Stream<Item = Result<Self::Block, Error>>>, Error>;
@@ -108,13 +109,23 @@ trait DenseAccessor {
 
 pub struct DenseFile<FE, T> {
     axis: usize,
-    shape: Vec<usize>,
+    shape: Shape,
     blocks: DirLock<FE>,
     dtype: PhantomData<T>,
 }
 
+impl<FE, T: DType> TensorInstance for DenseFile<FE, T> {
+    fn dtype(&self) -> NumberType {
+        T::dtype()
+    }
+
+    fn shape(&self) -> &[u64] {
+        &self.shape
+    }
+}
+
 #[async_trait]
-impl<FE, T> DenseAccessor for DenseFile<FE, T>
+impl<FE, T> DenseInstance for DenseFile<FE, T>
 where
     FE: FileLoad + AsType<Array<T>>,
     T: CDatatype + 'static,
@@ -136,7 +147,7 @@ where
             .map_err(Error::from)
             .map(move |array| {
                 let array = array?;
-                let block_size = self.shape.iter().rev().take(self.axis).product::<usize>();
+                let block_size = self.shape.iter().rev().take(self.axis).product::<u64>() as usize;
 
                 let block_shape = if self.axis == self.shape.len() - 1 {
                     vec![array.data.len()]
@@ -146,7 +157,13 @@ where
 
                     let mut shape = Vec::with_capacity(self.shape.len() - self.axis + 1);
                     shape.push(axis_dim);
-                    shape.extend(self.shape.iter().skip(self.axis).copied());
+                    shape.extend(
+                        self.shape
+                            .iter()
+                            .skip(self.axis)
+                            .copied()
+                            .map(|dim| dim as usize),
+                    );
 
                     shape
                 };

@@ -5,10 +5,10 @@ use async_trait::async_trait;
 use b_table::{Range, TableLock};
 use futures::{Stream, TryStreamExt};
 use ha_ndarray::CDatatype;
-use number_general::{Number, NumberCollator};
+use number_general::{DType, Number, NumberCollator, NumberType};
 use safecast::{AsType, CastInto};
 
-use super::{Coord, Error};
+use super::{Coord, Error, Shape, TensorInstance};
 
 mod stream;
 
@@ -69,12 +69,7 @@ impl fmt::Debug for IndexSchema {
 pub struct Schema {
     primary: IndexSchema,
     auxiliary: Vec<(String, IndexSchema)>,
-}
-
-impl Schema {
-    fn ndim(&self) -> usize {
-        self.primary.columns.len() - 1
-    }
+    shape: Shape,
 }
 
 impl b_table::Schema for Schema {
@@ -84,11 +79,11 @@ impl b_table::Schema for Schema {
     type Index = IndexSchema;
 
     fn key(&self) -> &[Self::Id] {
-        &self.primary.columns[..self.ndim()]
+        &self.primary.columns[..self.shape.len()]
     }
 
     fn values(&self) -> &[Self::Id] {
-        &self.primary.columns[self.ndim()..]
+        &self.primary.columns[self.shape.len()..]
     }
 
     fn primary(&self) -> &Self::Index {
@@ -100,7 +95,7 @@ impl b_table::Schema for Schema {
     }
 
     fn validate_key(&self, key: Vec<Self::Value>) -> Result<Vec<Self::Value>, Self::Error> {
-        if key.len() == self.ndim() {
+        if key.len() == self.shape.len() {
             Ok(key)
         } else {
             let cause = io::Error::new(
@@ -133,7 +128,7 @@ impl fmt::Debug for Schema {
 }
 
 #[async_trait]
-pub trait SparseAccessor {
+pub trait SparseInstance {
     type DType;
 
     async fn elements(
@@ -146,11 +141,21 @@ pub struct SparseTable<FE, T> {
     dtype: PhantomData<T>,
 }
 
+impl<FE, T: DType> TensorInstance for SparseTable<FE, T> {
+    fn dtype(&self) -> NumberType {
+        T::dtype()
+    }
+
+    fn shape(&self) -> &[u64] {
+        &self.table.schema().shape
+    }
+}
+
 #[async_trait]
-impl<FE, T> SparseAccessor for SparseTable<FE, T>
+impl<FE, T> SparseInstance for SparseTable<FE, T>
 where
     FE: AsType<Node> + Send + Sync + 'static,
-    T: CDatatype,
+    T: CDatatype + DType,
     Number: CastInto<T>,
 {
     type DType = T;
