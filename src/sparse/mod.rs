@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::ops::Bound;
 use std::pin::Pin;
 use std::{fmt, io};
 
+use crate::AxisBound;
 use async_trait::async_trait;
 use b_table::{Range, TableLock};
 use freqfs::DirLock;
@@ -11,7 +14,7 @@ use itertools::Itertools;
 use number_general::{DType, Number, NumberCollator, NumberType};
 use safecast::{AsType, CastInto};
 
-use super::{Coord, Error, Shape, TensorInstance};
+use super::{Bounds, Coord, Error, Shape, TensorInstance};
 
 mod stream;
 
@@ -230,6 +233,12 @@ where
     }
 }
 
+impl<FE, T> fmt::Debug for SparseTable<FE, T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "sparse table with shape {:?}", self.table.schema().shape)
+    }
+}
+
 #[derive(Clone)]
 pub struct SparseBroadcast<S> {
     source: S,
@@ -304,6 +313,123 @@ impl<S: SparseInstance> SparseInstance for SparseBroadcast<S> {
                 }
             })
             .try_flatten();
+
+        Ok(Box::pin(elements))
+    }
+}
+
+pub struct SparseSlice<FE, T> {
+    source: SparseTable<FE, T>,
+    bounds: Range<usize, Number>,
+    shape: Shape,
+}
+
+impl<FE, T> SparseSlice<FE, T>
+where
+    SparseTable<FE, T>: TensorInstance,
+{
+    fn new(source: SparseTable<FE, T>, bounds: Bounds) -> Result<Self, Error> {
+        if bounds.0.len() > source.ndim() {
+            return Err(Error::Bounds(format!(
+                "invalid slice bounds for {:?}: {:?}",
+                source, bounds.0
+            )));
+        }
+
+        debug_assert_eq!(bounds.0.len(), source.ndim());
+
+        let mut range = HashMap::new();
+        let mut shape = Vec::with_capacity(source.ndim());
+        for (x, bound) in bounds.0.iter().enumerate() {
+            match bound {
+                AxisBound::At(i) => {
+                    if *i >= source.shape()[x] {
+                        return Err(Error::Bounds(format!(
+                            "invalid index for axis {}: {}",
+                            x, i
+                        )));
+                    }
+
+                    range.insert(x, b_table::ColumnRange::Eq(*i));
+                }
+                AxisBound::In(start, stop, step) => {
+                    if stop < start {
+                        return Err(Error::Bounds(format!(
+                            "invalid range for axis {}: [{}, {})",
+                            x, start, stop
+                        )));
+                    } else if *step != 1 {
+                        return Err(Error::Bounds(format!(
+                            "sparse tensor does not support stride {}",
+                            step
+                        )));
+                    }
+
+                    let bound = (Bound::Included(*start), Bound::Excluded(*stop));
+                    range.insert(x, b_table::ColumnRange::In(bound));
+                    shape.push((stop - start) / step);
+                }
+                AxisBound::Of(indices) => {
+                    return Err(Error::Bounds(format!(
+                        "sparse tensor does not support axis bound {:?}",
+                        indices
+                    )));
+                }
+            }
+        }
+
+        let bounds = b_table::Range::try_from(bounds)?;
+
+        Ok(Self {
+            source,
+            bounds,
+            shape,
+        })
+    }
+}
+
+impl<FE, T> Clone for SparseSlice<FE, T> {
+    fn clone(&self) -> Self {
+        Self {
+            source: self.source.clone(),
+            bounds: self.bounds.clone(),
+            shape: self.shape.to_vec(),
+        }
+    }
+}
+
+impl<FE, T> TensorInstance for SparseSlice<FE, T>
+where
+    SparseTable<FE, T>: TensorInstance,
+{
+    fn dtype(&self) -> NumberType {
+        self.source.dtype()
+    }
+
+    fn shape(&self) -> &[u64] {
+        &self.shape
+    }
+}
+
+#[async_trait]
+impl<FE, T> SparseInstance for SparseSlice<FE, T>
+where
+    FE: AsType<Node> + Send + Sync + 'static,
+    T: CDatatype + DType,
+    Number: CastInto<T>,
+{
+    type DType = T;
+
+    async fn elements(
+        self,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<(Coord, Self::DType), Error>>>>, Error> {
+        let rows = self
+            .source
+            .table
+            .rows(self.bounds.clone(), &[], false)
+            .await?;
+
+        let elements = rows.map_ok(|row| unwrap_row(row)).map_err(Error::from);
 
         Ok(Box::pin(elements))
     }

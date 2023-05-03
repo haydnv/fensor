@@ -1,12 +1,20 @@
 use derive_more::Display;
-use ha_ndarray::AxisBound;
-use number_general::NumberType;
+use number_general::{Number, NumberType};
+use std::collections::HashMap;
+use std::ops::Bound;
 
 pub mod dense;
 pub mod sparse;
 
 pub type Coord = Vec<u64>;
 pub type Shape = Vec<u64>;
+
+#[derive(Clone, Debug)]
+pub enum AxisBound {
+    At(u64),
+    In(u64, u64, u64),
+    Of(Vec<u64>),
+}
 
 #[derive(Clone)]
 pub struct Bounds(Vec<AxisBound>);
