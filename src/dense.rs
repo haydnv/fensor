@@ -8,9 +8,7 @@ use ha_ndarray::*;
 use number_general::{DType, NumberType};
 use safecast::AsType;
 
-use super::{Error, Shape, TensorInstance};
-
-const IDEAL_BLOCK_SIZE: usize = 65_536;
+use super::{Error, Shape, TensorInstance, IDEAL_BLOCK_SIZE};
 
 pub struct Array<T> {
     data: Vec<T>,

@@ -9,6 +9,8 @@ pub mod sparse;
 pub type Coord = Vec<u64>;
 pub type Shape = Vec<u64>;
 
+const IDEAL_BLOCK_SIZE: usize = 65_536;
+
 #[derive(Clone, Debug)]
 pub enum AxisBound {
     At(u64),

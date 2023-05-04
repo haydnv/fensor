@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use b_table::{Range, TableLock};
 use freqfs::DirLock;
 use futures::stream::{Stream, StreamExt, TryStreamExt};
-use ha_ndarray::CDatatype;
+use ha_ndarray::*;
 use itertools::Itertools;
 use number_general::{DType, Number, NumberCollator, NumberType};
 use safecast::{AsType, CastInto};
@@ -470,6 +470,7 @@ where
 impl<FE, T> SparseInstance for SparseTranspose<FE, T>
 where
     FE: AsType<Node> + Send + Sync,
+    T: CDatatype,
     Number: CastInto<T>,
     SparseTable<FE, T>: SparseInstance,
 {
@@ -478,28 +479,48 @@ where
     async fn elements(
         self,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<(Coord, Self::DType), Error>>>>, Error> {
+        let ndim = self.ndim();
+        let size = self.size();
+        let permutation = self.permutation;
+
         let rows = self
             .source
             .table
-            .rows(Range::default(), &self.permutation, false)
+            .rows(Range::default(), &permutation, false)
             .await?;
 
-        let elements = rows
-            .map_err(Error::from)
-            .map_ok(|row| unwrap_row(row))
-            .map_ok(move |(source_coord, value)| {
-                let coord = self
-                    .permutation
-                    .iter()
-                    .copied()
-                    .map(|x| source_coord[x])
-                    .collect();
+        let context = ha_ndarray::Context::default()?;
+        let queue = ha_ndarray::Queue::new(context, size_hint(size))?;
+        let source_elements = rows.map_ok(unwrap_row).map_err(Error::from);
+        let blocks = stream::BlockCoords::new(source_elements, ndim);
+        let elements = blocks
+            .map(move |result| {
+                let (source_coords, values) = result?;
+                let coords = source_coords.transpose(Some(permutation.to_vec()))?;
+                Result::<_, Error>::Ok((coords.to_vec(&queue)?, values))
+            })
+            .map_ok(move |(coords, values)| {
+                let coords = coords
+                    .into_iter()
+                    .chunks(ndim)
+                    .into_iter()
+                    .map(|coord| coord.collect())
+                    .collect::<Vec<Coord>>();
 
-                (coord, value)
-            });
+                (coords, values)
+            })
+            .map_ok(|(coords, values)| {
+                futures::stream::iter(coords.into_iter().zip(values).map(Result::<_, Error>::Ok))
+            })
+            .try_flatten();
 
         Ok(Box::pin(elements))
     }
+}
+
+#[inline]
+fn size_hint(size: u64) -> usize {
+    size.try_into().ok().unwrap_or_else(|| usize::MAX)
 }
 
 #[inline]

@@ -1,13 +1,99 @@
 use std::cmp::Ordering;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 
-use futures::ready;
 use futures::stream::{Fuse, Stream, StreamExt};
-use ha_ndarray::CDatatype;
+use ha_ndarray::{ArrayBase, CDatatype};
 use pin_project::pin_project;
 
-use crate::Error;
+use crate::{Coord, Error, IDEAL_BLOCK_SIZE};
+
+#[pin_project]
+pub struct BlockCoords<S, T> {
+    #[pin]
+    source: Fuse<S>,
+    pending_coords: Vec<u64>,
+    pending_values: Vec<T>,
+    ndim: usize,
+}
+
+impl<S, T> BlockCoords<S, T>
+where
+    S: Stream<Item = Result<(Coord, T), Error>>,
+{
+    pub fn new(source: S, ndim: usize) -> Self {
+        Self {
+            source: source.fuse(),
+            pending_coords: Vec::with_capacity(IDEAL_BLOCK_SIZE),
+            pending_values: Vec::with_capacity(IDEAL_BLOCK_SIZE),
+            ndim,
+        }
+    }
+}
+
+impl<S, T> BlockCoords<S, T>
+where
+    T: CDatatype,
+{
+    fn block_cutoff(
+        pending_coords: &mut Vec<u64>,
+        pending_values: &mut Vec<T>,
+        ndim: usize,
+    ) -> Result<(ArrayBase<u64>, Vec<T>), Error> {
+        debug_assert_eq!(pending_coords.len() % ndim, 0);
+
+        let values = pending_values.drain(..).collect();
+        let coords = ArrayBase::new(
+            vec![pending_coords.len() / ndim, ndim],
+            pending_coords.drain(..).collect(),
+        )?;
+
+        Ok((coords, values))
+    }
+}
+
+impl<S, T> Stream for BlockCoords<S, T>
+where
+    S: Stream<Item = Result<(Coord, T), Error>> + Unpin,
+    T: CDatatype,
+{
+    type Item = Result<(ArrayBase<u64>, Vec<T>), Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cxt: &mut Context) -> Poll<Option<Self::Item>> {
+        let ndim = self.ndim;
+        let mut this = self.project();
+
+        Poll::Ready(loop {
+            debug_assert_eq!(this.pending_values.len() * ndim, this.pending_coords.len());
+
+            match ready!(this.source.as_mut().poll_next(cxt)) {
+                Some(Ok((coord, value))) => {
+                    debug_assert_eq!(coord.len(), *this.ndim);
+
+                    this.pending_coords.extend(coord);
+                    this.pending_values.push(value);
+
+                    if this.pending_values.len() == IDEAL_BLOCK_SIZE {
+                        break Some(Self::block_cutoff(
+                            this.pending_coords,
+                            this.pending_values,
+                            ndim,
+                        ));
+                    }
+                }
+                None if !this.pending_values.is_empty() => {
+                    break Some(Self::block_cutoff(
+                        this.pending_coords,
+                        this.pending_values,
+                        ndim,
+                    ));
+                }
+                None => break None,
+                Some(Err(cause)) => break Some(Err(cause)),
+            }
+        })
+    }
+}
 
 // Based on: https://github.com/rust-lang/futures-rs/blob/master/futures-util/src/stream/select.rs
 #[pin_project]
