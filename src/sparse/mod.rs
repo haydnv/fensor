@@ -167,7 +167,7 @@ impl fmt::Debug for Schema {
 
 #[async_trait]
 pub trait SparseInstance: TensorInstance {
-    type DType;
+    type DType: CDatatype + DType;
 
     async fn elements(
         self,
@@ -358,6 +358,93 @@ impl<S: SparseInstance> SparseInstance for SparseExpand<S> {
     }
 }
 
+#[derive(Clone)]
+pub struct SparseReshape<S> {
+    source: S,
+    source_strides: Vec<u64>,
+    shape: Shape,
+    strides: Vec<u64>,
+}
+
+impl<S: TensorInstance> SparseReshape<S> {
+    fn new(source: S, shape: Shape) -> Self {
+        let source_strides = strides_for(source.shape(), source.ndim());
+        let strides = strides_for(&shape, shape.len());
+
+        Self {
+            source,
+            source_strides,
+            shape,
+            strides,
+        }
+    }
+}
+
+impl<S: TensorInstance> TensorInstance for SparseReshape<S> {
+    fn dtype(&self) -> NumberType {
+        self.source.dtype()
+    }
+
+    fn shape(&self) -> &[u64] {
+        &self.shape
+    }
+}
+
+#[async_trait]
+impl<S: SparseInstance> SparseInstance for SparseReshape<S> {
+    type DType = S::DType;
+
+    async fn elements(
+        self,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<(Coord, Self::DType), Error>>>>, Error> {
+        let context = ha_ndarray::Context::default()?;
+        let queue = ha_ndarray::Queue::new(context, size_hint(self.size()))?;
+
+        let source_ndim = self.source.ndim();
+        let source_elements = self.source.elements().await?;
+        let source_strides = ArrayBase::new(vec![source_ndim], self.source_strides)?;
+
+        let ndim = self.shape.len();
+        let strides = ArrayBase::new(vec![ndim], self.strides)?;
+        let shape = ArrayBase::new(vec![ndim], self.shape)?;
+
+        let coord_blocks = stream::BlockCoords::new(source_elements, source_ndim);
+
+        let elements = coord_blocks
+            .map(move |result| {
+                let (source_coords, values) = result?;
+
+                debug_assert_eq!(source_coords.size() % source_ndim, 0);
+                debug_assert_eq!(source_coords.size() / source_ndim, values.len());
+
+                let source_strides = source_strides.broadcast(vec![values.len(), source_ndim])?;
+
+                let offsets = source_coords.mul(&source_strides)?;
+                let offsets = offsets.sum_axis(1)?;
+
+                let broadcast = vec![offsets.size(), ndim];
+                let strides = strides.broadcast(broadcast.to_vec())?;
+                let offsets = offsets
+                    .expand_dims(vec![1])?
+                    .broadcast(broadcast.to_vec())?;
+
+                let dims = shape.expand_dims(vec![0])?.broadcast(broadcast.to_vec())?;
+                let coords = (offsets / strides) % dims;
+
+                let coords = coords.to_vec(&queue)?;
+
+                Result::<_, Error>::Ok((coords, values))
+            })
+            .map_ok(move |(coords, values)| {
+                let coords = coords.into_par_iter().chunks(ndim).collect::<Vec<Coord>>();
+                futures::stream::iter(coords.into_iter().zip(values).map(Ok))
+            })
+            .try_flatten();
+
+        Ok(Box::pin(elements))
+    }
+}
+
 pub struct SparseSlice<FE, T> {
     source: SparseTable<FE, T>,
     bounds: Range<usize, Number>,
@@ -511,7 +598,7 @@ where
 impl<FE, T> SparseInstance for SparseTranspose<FE, T>
 where
     FE: AsType<Node> + Send + Sync,
-    T: CDatatype,
+    T: CDatatype + DType,
     Number: CastInto<T>,
     SparseTable<FE, T>: SparseInstance,
 {
@@ -556,6 +643,23 @@ where
 #[inline]
 fn size_hint(size: u64) -> usize {
     size.try_into().ok().unwrap_or_else(|| usize::MAX)
+}
+
+#[inline]
+fn strides_for(shape: &[u64], ndim: usize) -> Vec<u64> {
+    debug_assert!(ndim >= shape.len());
+
+    let zeros = std::iter::repeat(0).take(ndim - shape.len());
+
+    let strides = shape.iter().enumerate().map(|(x, dim)| {
+        if *dim == 1 {
+            0
+        } else {
+            shape.iter().rev().take(shape.len() - 1 - x).product()
+        }
+    });
+
+    zeros.chain(strides).collect()
 }
 
 #[inline]
