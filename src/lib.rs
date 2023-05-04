@@ -1,7 +1,7 @@
+extern crate core;
+
 use derive_more::Display;
-use number_general::{Number, NumberType};
-use std::collections::HashMap;
-use std::ops::Bound;
+use number_general::NumberType;
 
 pub mod dense;
 pub mod sparse;

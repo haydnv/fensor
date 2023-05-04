@@ -4,7 +4,6 @@ use std::ops::Bound;
 use std::pin::Pin;
 use std::{fmt, io};
 
-use crate::AxisBound;
 use async_trait::async_trait;
 use b_table::{Range, TableLock};
 use freqfs::DirLock;
@@ -14,7 +13,7 @@ use itertools::Itertools;
 use number_general::{DType, Number, NumberCollator, NumberType};
 use safecast::{AsType, CastInto};
 
-use super::{Bounds, Coord, Error, Shape, TensorInstance};
+use super::{AxisBound, Bounds, Coord, Error, Shape, TensorInstance};
 
 mod stream;
 
@@ -350,7 +349,7 @@ where
                         )));
                     }
 
-                    range.insert(x, b_table::ColumnRange::Eq(*i));
+                    range.insert(x, b_table::ColumnRange::Eq(Number::from(*i)));
                 }
                 AxisBound::In(start, stop, step) => {
                     if stop < start {
@@ -365,9 +364,12 @@ where
                         )));
                     }
 
-                    let bound = (Bound::Included(*start), Bound::Excluded(*stop));
-                    range.insert(x, b_table::ColumnRange::In(bound));
                     shape.push((stop - start) / step);
+
+                    let start = Bound::Included(Number::from(*start));
+                    let stop = Bound::Excluded(Number::from(*stop));
+
+                    range.insert(x, b_table::ColumnRange::In((start, stop)));
                 }
                 AxisBound::Of(indices) => {
                     return Err(Error::Bounds(format!(
@@ -378,7 +380,7 @@ where
             }
         }
 
-        let bounds = b_table::Range::try_from(bounds)?;
+        let bounds = range.into();
 
         Ok(Self {
             source,
@@ -430,6 +432,71 @@ where
             .await?;
 
         let elements = rows.map_ok(|row| unwrap_row(row)).map_err(Error::from);
+
+        Ok(Box::pin(elements))
+    }
+}
+
+pub struct SparseTranspose<FE, T> {
+    source: SparseTable<FE, T>,
+    permutation: Vec<usize>,
+    shape: Shape,
+}
+
+impl<FE, T> Clone for SparseTranspose<FE, T> {
+    fn clone(&self) -> Self {
+        Self {
+            source: self.source.clone(),
+            permutation: self.permutation.to_vec(),
+            shape: self.shape.to_vec(),
+        }
+    }
+}
+
+impl<FE, T> TensorInstance for SparseTranspose<FE, T>
+where
+    SparseTable<FE, T>: TensorInstance,
+{
+    fn dtype(&self) -> NumberType {
+        self.source.dtype()
+    }
+
+    fn shape(&self) -> &[u64] {
+        &self.shape
+    }
+}
+
+#[async_trait]
+impl<FE, T> SparseInstance for SparseTranspose<FE, T>
+where
+    FE: AsType<Node> + Send + Sync,
+    Number: CastInto<T>,
+    SparseTable<FE, T>: SparseInstance,
+{
+    type DType = T;
+
+    async fn elements(
+        self,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<(Coord, Self::DType), Error>>>>, Error> {
+        let rows = self
+            .source
+            .table
+            .rows(Range::default(), &self.permutation, false)
+            .await?;
+
+        let elements = rows
+            .map_err(Error::from)
+            .map_ok(|row| unwrap_row(row))
+            .map_ok(move |(source_coord, value)| {
+                let coord = self
+                    .permutation
+                    .iter()
+                    .copied()
+                    .map(|x| source_coord[x])
+                    .collect();
+
+                (coord, value)
+            });
 
         Ok(Box::pin(elements))
     }
