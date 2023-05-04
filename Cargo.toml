@@ -26,4 +26,5 @@ itertools = "0.10"
 number-general = { path = "../number-general", features = ["stream"] }
 num_cpus = "1.15"
 pin-project = "1.0"
+rayon = "1.7"
 safecast = { path = "../safecast" }

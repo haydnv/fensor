@@ -11,6 +11,7 @@ use futures::stream::{Stream, StreamExt, TryStreamExt};
 use ha_ndarray::*;
 use itertools::Itertools;
 use number_general::{DType, Number, NumberCollator, NumberType};
+use rayon::prelude::*;
 use safecast::{AsType, CastInto};
 
 use super::{AxisBound, Bounds, Coord, Error, Shape, TensorInstance};
@@ -500,13 +501,7 @@ where
                 Result::<_, Error>::Ok((coords.to_vec(&queue)?, values))
             })
             .map_ok(move |(coords, values)| {
-                let coords = coords
-                    .into_iter()
-                    .chunks(ndim)
-                    .into_iter()
-                    .map(|coord| coord.collect())
-                    .collect::<Vec<Coord>>();
-
+                let coords = coords.into_par_iter().chunks(ndim).collect::<Vec<Coord>>();
                 (coords, values)
             })
             .map_ok(|(coords, values)| {
