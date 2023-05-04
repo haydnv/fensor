@@ -318,10 +318,60 @@ impl<S: SparseInstance> SparseInstance for SparseBroadcast<S> {
     }
 }
 
+#[derive(Clone)]
+pub struct SparseExpand<S> {
+    source: S,
+    shape: Shape,
+    axis: usize,
+}
+
+impl<S: TensorInstance> TensorInstance for SparseExpand<S> {
+    fn dtype(&self) -> NumberType {
+        self.source.dtype()
+    }
+
+    fn shape(&self) -> &[u64] {
+        &self.shape
+    }
+}
+
+#[async_trait]
+impl<S: SparseInstance> SparseInstance for SparseExpand<S> {
+    type DType = S::DType;
+
+    async fn elements(
+        self,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<(Coord, Self::DType), Error>>>>, Error> {
+        let axis = self.axis;
+        let ndim = self.ndim();
+        debug_assert_eq!(self.source.ndim() + 1, ndim);
+
+        let source_elements = self.source.elements().await?;
+
+        let elements = source_elements.map_ok(move |(mut coord, value)| {
+            coord.insert(axis, 0);
+            debug_assert_eq!(coord.len(), ndim);
+            (coord, value)
+        });
+
+        Ok(Box::pin(elements))
+    }
+}
+
 pub struct SparseSlice<FE, T> {
     source: SparseTable<FE, T>,
     bounds: Range<usize, Number>,
     shape: Shape,
+}
+
+impl<FE, T> Clone for SparseSlice<FE, T> {
+    fn clone(&self) -> Self {
+        Self {
+            source: self.source.clone(),
+            bounds: self.bounds.clone(),
+            shape: self.shape.to_vec(),
+        }
+    }
 }
 
 impl<FE, T> SparseSlice<FE, T>
@@ -388,16 +438,6 @@ where
             bounds,
             shape,
         })
-    }
-}
-
-impl<FE, T> Clone for SparseSlice<FE, T> {
-    fn clone(&self) -> Self {
-        Self {
-            source: self.source.clone(),
-            bounds: self.bounds.clone(),
-            shape: self.shape.to_vec(),
-        }
     }
 }
 
