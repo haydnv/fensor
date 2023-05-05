@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::mem;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 
@@ -88,6 +89,66 @@ where
                         ndim,
                     ));
                 }
+                None => break None,
+                Some(Err(cause)) => break Some(Err(cause)),
+            }
+        })
+    }
+}
+
+#[pin_project]
+pub struct FilledAt<S> {
+    #[pin]
+    source: S,
+
+    pending: Option<Vec<u64>>,
+    axes: Vec<usize>,
+    ndim: usize,
+}
+
+impl<S> FilledAt<S> {
+    pub fn new(source: S, axes: Vec<usize>, ndim: usize) -> Self {
+        debug_assert!(!axes.iter().copied().any(|x| x >= ndim));
+
+        Self {
+            source,
+            pending: None,
+            axes,
+            ndim,
+        }
+    }
+}
+
+impl<T, S: Stream<Item = Result<(Coord, T), Error>>> Stream for FilledAt<S> {
+    type Item = Result<Vec<u64>, Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cxt: &mut Context) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+
+        Poll::Ready(loop {
+            match ready!(this.source.as_mut().poll_next(cxt)) {
+                Some(Ok((coord, _))) => match this.pending.as_mut() {
+                    None => {
+                        let filled = this.axes.iter().copied().map(|x| coord[x]).collect();
+                        *this.pending = Some(filled);
+                    }
+                    Some(pending) => {
+                        if this
+                            .axes
+                            .iter()
+                            .copied()
+                            .map(|x| coord[x])
+                            .zip(pending.iter().copied())
+                            .any(|(l, r)| l != r)
+                        {
+                            let mut filled =
+                                Some(this.axes.iter().copied().map(|x| coord[x]).collect());
+
+                            mem::swap(&mut *this.pending, &mut filled);
+                            break filled.map(Ok);
+                        }
+                    }
+                },
                 None => break None,
                 Some(Err(cause)) => break Some(Err(cause)),
             }

@@ -8,6 +8,7 @@ use std::{fmt, io};
 use async_trait::async_trait;
 use b_table::{Range, TableLock};
 use freqfs::DirLock;
+use futures::future::TryFutureExt;
 use futures::stream::{Stream, StreamExt, TryStreamExt};
 use ha_ndarray::*;
 use number_general::{DType, Number, NumberCollator, NumberType};
@@ -20,6 +21,7 @@ mod stream;
 
 const BLOCK_SIZE: usize = 4_096;
 
+pub type Elements<T> = Pin<Box<dyn Stream<Item = Result<(Coord, T), Error>>>>;
 pub type Node = b_table::b_tree::Node<Vec<Vec<Number>>>;
 
 #[derive(Clone, Eq, PartialEq)]
@@ -169,10 +171,19 @@ impl fmt::Debug for Schema {
 pub trait SparseInstance: TensorInstance {
     type DType: CDatatype + DType;
 
-    async fn elements(
+    async fn elements(self, bounds: Bounds) -> Result<Elements<Self::DType>, Error>;
+
+    async fn filled_at(
         self,
         bounds: Bounds,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<(Coord, Self::DType), Error>>>>, Error>;
+        axes: Vec<usize>,
+    ) -> Result<stream::FilledAt<Elements<Self::DType>>, Error> {
+        let ndim = self.ndim();
+
+        self.elements(bounds)
+            .map_ok(|elements| stream::FilledAt::new(elements, axes, ndim))
+            .await
+    }
 }
 
 pub struct SparseTable<FE, T> {
@@ -225,10 +236,7 @@ where
 {
     type DType = T;
 
-    async fn elements(
-        self,
-        bounds: Bounds,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<(Coord, Self::DType), Error>>>>, Error> {
+    async fn elements(self, bounds: Bounds) -> Result<Elements<Self::DType>, Error> {
         let range = range_from_bounds(&bounds, self.shape())?;
         let rows = self.table.rows(range, &[], false).await?;
         let elements = rows.map_ok(|row| unwrap_row(row)).map_err(Error::from);
@@ -290,10 +298,7 @@ impl<S: TensorInstance> TensorInstance for SparseBroadcast<S> {
 impl<S: SparseInstance> SparseInstance for SparseBroadcast<S> {
     type DType = S::DType;
 
-    async fn elements(
-        self,
-        _bounds: Bounds,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<(Coord, Self::DType), Error>>>>, Error> {
+    async fn elements(self, _bounds: Bounds) -> Result<Elements<Self::DType>, Error> {
         todo!()
     }
 }
@@ -319,10 +324,7 @@ impl<S: TensorInstance> TensorInstance for SparseExpand<S> {
 impl<S: SparseInstance> SparseInstance for SparseExpand<S> {
     type DType = S::DType;
 
-    async fn elements(
-        self,
-        mut bounds: Bounds,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<(Coord, Self::DType), Error>>>>, Error> {
+    async fn elements(self, mut bounds: Bounds) -> Result<Elements<Self::DType>, Error> {
         let source_bounds = if bounds.0.len() > self.axis {
             bounds.0.remove(self.axis);
             bounds
@@ -382,10 +384,7 @@ impl<S: TensorInstance> TensorInstance for SparseReshape<S> {
 impl<S: SparseInstance> SparseInstance for SparseReshape<S> {
     type DType = S::DType;
 
-    async fn elements(
-        self,
-        bounds: Bounds,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<(Coord, Self::DType), Error>>>>, Error> {
+    async fn elements(self, bounds: Bounds) -> Result<Elements<Self::DType>, Error> {
         let source_bounds = if bounds.0.is_empty() {
             Ok(bounds)
         } else {
@@ -505,10 +504,7 @@ where
 {
     type DType = S::DType;
 
-    async fn elements(
-        self,
-        bounds: Bounds,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<(Coord, Self::DType), Error>>>>, Error> {
+    async fn elements(self, bounds: Bounds) -> Result<Elements<Self::DType>, Error> {
         let source_bounds = if bounds.0.is_empty() {
             self.bounds
         } else if bounds.0.len() > self.ndim() {
@@ -611,10 +607,7 @@ where
 {
     type DType = S::DType;
 
-    async fn elements(
-        self,
-        mut bounds: Bounds,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<(Coord, Self::DType), Error>>>>, Error> {
+    async fn elements(self, mut bounds: Bounds) -> Result<Elements<Self::DType>, Error> {
         let bounds = match bounds.0.len().cmp(&self.ndim()) {
             Ordering::Equal => Ok(bounds),
             Ordering::Greater => Err(Error::Bounds(format!(
