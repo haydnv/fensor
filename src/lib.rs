@@ -57,7 +57,7 @@ impl From<ha_ndarray::Error> for Error {
     }
 }
 
-pub trait TensorInstance: Clone + Send + Sync + 'static {
+pub trait TensorInstance: Send + Sync + 'static {
     fn dtype(&self) -> NumberType;
 
     fn ndim(&self) -> usize {

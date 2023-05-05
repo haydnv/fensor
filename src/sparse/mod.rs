@@ -168,7 +168,7 @@ impl fmt::Debug for Schema {
 }
 
 #[async_trait]
-pub trait SparseInstance: TensorInstance {
+pub trait SparseInstance: TensorInstance + fmt::Debug {
     type DType: CDatatype + DType;
 
     async fn elements(self, bounds: Bounds) -> Result<Elements<Self::DType>, Error>;
@@ -177,7 +177,10 @@ pub trait SparseInstance: TensorInstance {
         self,
         bounds: Bounds,
         axes: Vec<usize>,
-    ) -> Result<stream::FilledAt<Elements<Self::DType>>, Error> {
+    ) -> Result<stream::FilledAt<Elements<Self::DType>>, Error>
+    where
+        Self: Sized,
+    {
         let ndim = self.ndim();
 
         self.elements(bounds)
@@ -251,40 +254,43 @@ impl<FE, T> fmt::Debug for SparseTable<FE, T> {
 }
 
 #[derive(Clone)]
-pub struct SparseBroadcast<S> {
+pub struct SparseBroadcastAxis<S> {
     source: S,
+    axis: usize,
+    dim: u64,
     shape: Shape,
 }
 
-impl<S: TensorInstance + fmt::Debug> SparseBroadcast<S> {
-    fn new(source: S, shape: Shape) -> Result<Self, Error> {
-        if shape.len() < source.ndim() {
-            return Err(Error::Bounds(format!(
-                "cannot broadcast {:?} into {:?}",
-                source, shape
-            )));
-        }
-
-        for (dim, bdim) in source
-            .shape()
-            .iter()
-            .zip(shape.iter().skip(shape.len() - source.ndim()))
-        {
-            if dim == bdim || *dim == 1 {
-                // pass
+impl<S: TensorInstance + fmt::Debug> SparseBroadcastAxis<S> {
+    fn new(source: S, axis: usize, dim: u64) -> Result<Self, Error> {
+        let shape = if axis < source.ndim() {
+            let mut shape = source.shape().to_vec();
+            if shape[axis] == 1 {
+                shape[axis] = dim;
+                Ok(shape)
             } else {
-                return Err(Error::Bounds(format!(
+                Err(Error::Bounds(format!(
                     "cannot broadcast dimension {} into {}",
-                    dim, bdim
-                )));
+                    shape[axis], dim
+                )))
             }
-        }
+        } else {
+            Err(Error::Bounds(format!(
+                "invalid axis for {:?}: {}",
+                source, axis
+            )))
+        }?;
 
-        Ok(Self { source, shape })
+        Ok(Self {
+            source,
+            axis,
+            dim,
+            shape,
+        })
     }
 }
 
-impl<S: TensorInstance> TensorInstance for SparseBroadcast<S> {
+impl<S: TensorInstance> TensorInstance for SparseBroadcastAxis<S> {
     fn dtype(&self) -> NumberType {
         self.source.dtype()
     }
@@ -295,14 +301,59 @@ impl<S: TensorInstance> TensorInstance for SparseBroadcast<S> {
 }
 
 #[async_trait]
-impl<S: SparseInstance> SparseInstance for SparseBroadcast<S> {
+impl<S: SparseInstance> SparseInstance for SparseBroadcastAxis<S> {
     type DType = S::DType;
 
-    async fn elements(self, _bounds: Bounds) -> Result<Elements<Self::DType>, Error> {
-        todo!()
+    async fn elements(self, bounds: Bounds) -> Result<Elements<Self::DType>, Error> {
+        let (source_bounds, dim) = if bounds.0.len() > self.axis {
+            let bdim = match &bounds.0[self.axis] {
+                AxisBound::At(i) if *i < self.dim => Ok(1),
+                AxisBound::In(start, stop, 1) if stop > start => Ok(stop - start),
+                bound => Err(Error::Bounds(format!(
+                    "invalid bound for axis {}: {:?}",
+                    self.axis, bound
+                ))),
+            }?;
+
+            let mut source_bounds = bounds;
+            source_bounds.0[self.axis] = AxisBound::At(0);
+            (source_bounds, bdim)
+        } else {
+            (bounds, self.dim)
+        };
+
+        if self.axis == self.ndim() - 1 {
+            let source_elements = self.source.elements(source_bounds).await?;
+
+            let elements = source_elements
+                .map_ok(move |(source_coord, value)| {
+                    futures::stream::iter(0..dim).map(move |i| {
+                        let mut coord = source_coord.to_vec();
+                        *coord.last_mut().expect("x") = i;
+                        Ok((coord, value))
+                    })
+                })
+                .try_flatten();
+
+            Ok(Box::pin(elements))
+        } else {
+            let axes = (0..self.axis).into_iter().collect();
+            let _filled = self.source.filled_at(source_bounds, axes).await?;
+
+            // TODO: for each filled prefix, slice the source tensor and repeat the slice dim times
+
+            todo!()
+        }
     }
 }
 
+impl<S: fmt::Debug> fmt::Debug for SparseBroadcastAxis<S> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "broadcast of {:?} axis {}", self.source, self.axis)
+    }
+}
+
+// TODO: support multiple axes
 #[derive(Clone)]
 pub struct SparseExpand<S> {
     source: S,
@@ -345,6 +396,12 @@ impl<S: SparseInstance> SparseInstance for SparseExpand<S> {
         });
 
         Ok(Box::pin(elements))
+    }
+}
+
+impl<S: fmt::Debug> fmt::Debug for SparseExpand<S> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "expand axis {:?} of {:?}", self.axis, self.source)
     }
 }
 
@@ -439,6 +496,12 @@ impl<S: SparseInstance> SparseInstance for SparseReshape<S> {
     }
 }
 
+impl<S: fmt::Debug> fmt::Debug for SparseReshape<S> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "reshape {:?} into {:?}", self.source, self.shape)
+    }
+}
+
 #[derive(Clone)]
 pub struct SparseSlice<S> {
     source: S,
@@ -500,7 +563,7 @@ where
 #[async_trait]
 impl<S> SparseInstance for SparseSlice<S>
 where
-    S: SparseInstance + fmt::Debug,
+    S: SparseInstance,
 {
     type DType = S::DType;
 
@@ -603,7 +666,7 @@ where
 #[async_trait]
 impl<S> SparseInstance for SparseTranspose<S>
 where
-    S: SparseInstance + fmt::Debug,
+    S: SparseInstance,
 {
     type DType = S::DType;
 
