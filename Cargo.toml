@@ -17,7 +17,6 @@ opencl = ["ha-ndarray/opencl"]
 [dependencies]
 async-trait = "0.1"
 b-table = { path = "../b-table", features = ["stream"] }
-derive_more = "0.99"
 destream = { path = "../destream" }
 freqfs = { path = "../freqfs", features = ["stream"] }
 futures = "0.3"

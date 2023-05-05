@@ -1,6 +1,5 @@
-extern crate core;
+use std::fmt;
 
-use derive_more::Display;
 use number_general::NumberType;
 
 pub mod dense;
@@ -18,14 +17,30 @@ pub enum AxisBound {
     Of(Vec<u64>),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Default)]
 pub struct Bounds(Vec<AxisBound>);
 
-#[derive(Debug, Display)]
+impl FromIterator<AxisBound> for Bounds {
+    fn from_iter<I: IntoIterator<Item = AxisBound>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+#[derive(Debug)]
 pub enum Error {
     Bounds(String),
     IO(std::io::Error),
     Math(ha_ndarray::Error),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Bounds(cause) => cause.fmt(f),
+            Self::IO(cause) => cause.fmt(f),
+            Self::Math(cause) => cause.fmt(f),
+        }
+    }
 }
 
 impl std::error::Error for Error {}

@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::ops::Bound;
@@ -170,6 +171,7 @@ pub trait SparseInstance: TensorInstance {
 
     async fn elements(
         self,
+        bounds: Bounds,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<(Coord, Self::DType), Error>>>>, Error>;
 }
 
@@ -225,8 +227,10 @@ where
 
     async fn elements(
         self,
+        bounds: Bounds,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<(Coord, Self::DType), Error>>>>, Error> {
-        let rows = self.table.rows(Range::default(), &[], false).await?;
+        let range = range_from_bounds(&bounds, self.shape())?;
+        let rows = self.table.rows(range, &[], false).await?;
         let elements = rows.map_ok(|row| unwrap_row(row)).map_err(Error::from);
         Ok(Box::pin(elements))
     }
@@ -288,6 +292,7 @@ impl<S: SparseInstance> SparseInstance for SparseBroadcast<S> {
 
     async fn elements(
         self,
+        _bounds: Bounds,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<(Coord, Self::DType), Error>>>>, Error> {
         todo!()
     }
@@ -316,12 +321,20 @@ impl<S: SparseInstance> SparseInstance for SparseExpand<S> {
 
     async fn elements(
         self,
+        mut bounds: Bounds,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<(Coord, Self::DType), Error>>>>, Error> {
+        let source_bounds = if bounds.0.len() > self.axis {
+            bounds.0.remove(self.axis);
+            bounds
+        } else {
+            bounds
+        };
+
         let axis = self.axis;
         let ndim = self.ndim();
         debug_assert_eq!(self.source.ndim() + 1, ndim);
 
-        let source_elements = self.source.elements().await?;
+        let source_elements = self.source.elements(source_bounds).await?;
 
         let elements = source_elements.map_ok(move |(mut coord, value)| {
             coord.insert(axis, 0);
@@ -371,12 +384,21 @@ impl<S: SparseInstance> SparseInstance for SparseReshape<S> {
 
     async fn elements(
         self,
+        bounds: Bounds,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<(Coord, Self::DType), Error>>>>, Error> {
+        let source_bounds = if bounds.0.is_empty() {
+            Ok(bounds)
+        } else {
+            Err(Error::Bounds(format!(
+                "cannot slice a reshaped sparse tensor (consider making a copy first)"
+            )))
+        }?;
+
         let context = ha_ndarray::Context::default()?;
         let queue = ha_ndarray::Queue::new(context, size_hint(self.size()))?;
 
         let source_ndim = self.source.ndim();
-        let source_elements = self.source.elements().await?;
+        let source_elements = self.source.elements(source_bounds).await?;
         let source_strides = ArrayBase::new(vec![source_ndim], self.source_strides)?;
 
         let ndim = self.shape.len();
@@ -418,27 +440,18 @@ impl<S: SparseInstance> SparseInstance for SparseReshape<S> {
     }
 }
 
-pub struct SparseSlice<FE, T> {
-    source: SparseTable<FE, T>,
-    bounds: Range<usize, Number>,
+#[derive(Clone)]
+pub struct SparseSlice<S> {
+    source: S,
+    bounds: Bounds,
     shape: Shape,
 }
 
-impl<FE, T> Clone for SparseSlice<FE, T> {
-    fn clone(&self) -> Self {
-        Self {
-            source: self.source.clone(),
-            bounds: self.bounds.clone(),
-            shape: self.shape.to_vec(),
-        }
-    }
-}
-
-impl<FE, T> SparseSlice<FE, T>
+impl<S> SparseSlice<S>
 where
-    SparseTable<FE, T>: TensorInstance,
+    S: TensorInstance + fmt::Debug,
 {
-    fn new(source: SparseTable<FE, T>, bounds: Bounds) -> Result<Self, Error> {
+    fn new(source: S, bounds: Bounds) -> Result<Self, Error> {
         if bounds.0.len() > source.ndim() {
             return Err(Error::Bounds(format!(
                 "invalid slice bounds for {:?}: {:?}",
@@ -446,52 +459,23 @@ where
             )));
         }
 
-        debug_assert_eq!(bounds.0.len(), source.ndim());
-
-        let mut range = HashMap::new();
         let mut shape = Vec::with_capacity(source.ndim());
         for (x, bound) in bounds.0.iter().enumerate() {
             match bound {
-                AxisBound::At(i) => {
-                    if *i >= source.shape()[x] {
-                        return Err(Error::Bounds(format!(
-                            "invalid index for axis {}: {}",
-                            x, i
-                        )));
-                    }
-
-                    range.insert(x, b_table::ColumnRange::Eq(Number::from(*i)));
+                AxisBound::At(_) => {} // no-op
+                AxisBound::In(start, stop, 1) => {
+                    shape.push(stop - start);
                 }
-                AxisBound::In(start, stop, step) => {
-                    if stop < start {
-                        return Err(Error::Bounds(format!(
-                            "invalid range for axis {}: [{}, {})",
-                            x, start, stop
-                        )));
-                    } else if *step != 1 {
-                        return Err(Error::Bounds(format!(
-                            "sparse tensor does not support stride {}",
-                            step
-                        )));
-                    }
-
-                    shape.push((stop - start) / step);
-
-                    let start = Bound::Included(Number::from(*start));
-                    let stop = Bound::Excluded(Number::from(*stop));
-
-                    range.insert(x, b_table::ColumnRange::In((start, stop)));
-                }
-                AxisBound::Of(indices) => {
+                axis_bound => {
                     return Err(Error::Bounds(format!(
-                        "sparse tensor does not support axis bound {:?}",
-                        indices
+                        "invalid bound for sparse tensor axis {}: {:?}",
+                        x, axis_bound
                     )));
                 }
             }
         }
 
-        let bounds = range.into();
+        shape.extend_from_slice(&source.shape()[bounds.0.len()..]);
 
         Ok(Self {
             source,
@@ -501,9 +485,9 @@ where
     }
 }
 
-impl<FE, T> TensorInstance for SparseSlice<FE, T>
+impl<S> TensorInstance for SparseSlice<S>
 where
-    SparseTable<FE, T>: TensorInstance,
+    S: TensorInstance,
 {
     fn dtype(&self) -> NumberType {
         self.source.dtype()
@@ -515,48 +499,101 @@ where
 }
 
 #[async_trait]
-impl<FE, T> SparseInstance for SparseSlice<FE, T>
+impl<S> SparseInstance for SparseSlice<S>
 where
-    FE: AsType<Node> + Send + Sync + 'static,
-    T: CDatatype + DType,
-    Number: CastInto<T>,
+    S: SparseInstance + fmt::Debug,
 {
-    type DType = T;
+    type DType = S::DType;
 
     async fn elements(
         self,
+        bounds: Bounds,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<(Coord, Self::DType), Error>>>>, Error> {
-        let rows = self
-            .source
-            .table
-            .rows(self.bounds.clone(), &[], false)
-            .await?;
+        let source_bounds = if bounds.0.is_empty() {
+            self.bounds
+        } else if bounds.0.len() > self.ndim() {
+            return Err(Error::Bounds(format!(
+                "invalid bounds for {:?}: {:?}",
+                self, bounds.0
+            )));
+        } else {
+            let mut source_bounds = Vec::with_capacity(self.source.ndim());
 
-        let elements = rows.map_ok(|row| unwrap_row(row)).map_err(Error::from);
+            let mut axis = 0;
+            for bound in self.bounds.0.into_iter().take(bounds.0.len()) {
+                match bound {
+                    AxisBound::At(i) => {
+                        source_bounds.push(AxisBound::At(i));
+                    }
+                    AxisBound::In(start, stop, 1) => {
+                        let source_bound = match &bounds.0[axis] {
+                            AxisBound::At(i) => {
+                                let i = start + i;
+                                if i < stop {
+                                    Ok(AxisBound::At(i))
+                                } else {
+                                    Err(Error::Bounds(format!(
+                                        "index {} is out of bounds for axis {}",
+                                        i, axis
+                                    )))
+                                }
+                            }
+                            AxisBound::In(start, stop, 1) => {
+                                let (source_start, source_stop) = (start + start, stop + start);
+                                if source_stop <= *stop {
+                                    Ok(AxisBound::In(source_start, source_stop, 1))
+                                } else {
+                                    Err(Error::Bounds(format!(
+                                        "range [{}, {}) is out of bounds for axis {}",
+                                        source_start, source_stop, axis
+                                    )))
+                                }
+                            }
+                            bound => Err(Error::Bounds(format!(
+                                "invalid bound for axis {}: {:?}",
+                                axis, bound
+                            ))),
+                        }?;
 
-        Ok(Box::pin(elements))
+                        source_bounds.push(source_bound);
+                        axis += 1;
+                    }
+                    bound => {
+                        return Err(Error::Bounds(format!(
+                            "invalid bound for sparse tensor: {:?}",
+                            bound
+                        )))
+                    }
+                }
+            }
+
+            Bounds(source_bounds)
+        };
+
+        self.source.elements(source_bounds).await
     }
 }
 
-pub struct SparseTranspose<FE, T> {
-    source: SparseTable<FE, T>,
+impl<S: fmt::Debug> fmt::Debug for SparseSlice<S> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "slice of {:?} with bounds {:?}",
+            self.source, self.bounds
+        )
+    }
+}
+
+#[derive(Clone)]
+pub struct SparseTranspose<S> {
+    source: S,
     permutation: Vec<usize>,
     shape: Shape,
 }
 
-impl<FE, T> Clone for SparseTranspose<FE, T> {
-    fn clone(&self) -> Self {
-        Self {
-            source: self.source.clone(),
-            permutation: self.permutation.to_vec(),
-            shape: self.shape.to_vec(),
-        }
-    }
-}
-
-impl<FE, T> TensorInstance for SparseTranspose<FE, T>
+impl<S> TensorInstance for SparseTranspose<S>
 where
-    SparseTable<FE, T>: TensorInstance,
+    S: TensorInstance,
 {
     fn dtype(&self) -> NumberType {
         self.source.dtype()
@@ -568,31 +605,42 @@ where
 }
 
 #[async_trait]
-impl<FE, T> SparseInstance for SparseTranspose<FE, T>
+impl<S> SparseInstance for SparseTranspose<S>
 where
-    FE: AsType<Node> + Send + Sync,
-    T: CDatatype + DType,
-    Number: CastInto<T>,
-    SparseTable<FE, T>: SparseInstance,
+    S: SparseInstance + fmt::Debug,
 {
-    type DType = T;
+    type DType = S::DType;
 
     async fn elements(
         self,
+        mut bounds: Bounds,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<(Coord, Self::DType), Error>>>>, Error> {
+        let bounds = match bounds.0.len().cmp(&self.ndim()) {
+            Ordering::Equal => Ok(bounds),
+            Ordering::Greater => Err(Error::Bounds(format!(
+                "invalid bounds for {:?}: {:?}",
+                self, bounds
+            ))),
+            Ordering::Less => {
+                let dims = self.shape.iter().skip(bounds.0.len()).copied();
+                bounds.0.extend(dims.map(|dim| AxisBound::In(0, dim, 1)));
+                Ok(bounds)
+            }
+        }?;
+
         let ndim = self.ndim();
         let size = self.size();
         let permutation = self.permutation;
 
-        let rows = self
-            .source
-            .table
-            .rows(Range::default(), &permutation, false)
-            .await?;
+        let source_bounds = permutation
+            .iter()
+            .copied()
+            .map(|x| bounds.0[x].clone())
+            .collect();
 
         let context = ha_ndarray::Context::default()?;
         let queue = ha_ndarray::Queue::new(context, size_hint(size))?;
-        let source_elements = rows.map_ok(unwrap_row).map_err(Error::from);
+        let source_elements = self.source.elements(source_bounds).await?;
         let blocks = stream::BlockCoords::new(source_elements, ndim);
         let elements = blocks
             .map(move |result| {
@@ -610,6 +658,16 @@ where
             .try_flatten();
 
         Ok(Box::pin(elements))
+    }
+}
+
+impl<S: fmt::Debug> fmt::Debug for SparseTranspose<S> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "transpose of {:?} with permutation {:?}",
+            self.source, self.permutation
+        )
     }
 }
 
@@ -643,4 +701,63 @@ where
     let n = row.pop().expect("n").cast_into();
     let coord = row.into_iter().map(|i| i.cast_into()).collect();
     (coord, n)
+}
+
+#[inline]
+fn range_from_bounds(bounds: &Bounds, shape: &[u64]) -> Result<Range<usize, Number>, Error> {
+    if bounds.0.is_empty() {
+        return Ok(Range::default());
+    } else if bounds.0.len() > shape.len() {
+        return Err(Error::Bounds(format!(
+            "invalid bounds for shape {:?}: {:?}",
+            shape, bounds.0
+        )));
+    }
+
+    let mut range = HashMap::new();
+
+    for (x, bound) in bounds.0.iter().enumerate() {
+        match bound {
+            AxisBound::At(i) => {
+                if *i >= shape[x] {
+                    return Err(Error::Bounds(format!(
+                        "invalid index for axis {}: {}",
+                        x, i
+                    )));
+                }
+
+                range.insert(x, b_table::ColumnRange::Eq(Number::from(*i)));
+            }
+            AxisBound::In(start, stop, step) => {
+                if stop < start {
+                    return Err(Error::Bounds(format!(
+                        "invalid range for axis {}: [{}, {})",
+                        x, start, stop
+                    )));
+                } else if *step != 1 {
+                    return Err(Error::Bounds(format!(
+                        "sparse tensor does not support stride {}",
+                        step
+                    )));
+                } else if *stop > shape[x] {
+                    return Err(Error::Bounds(format!(
+                        "index {} is out of bounds for dimension {}",
+                        stop, shape[x]
+                    )));
+                }
+
+                let start = Bound::Included(Number::from(*start));
+                let stop = Bound::Excluded(Number::from(*stop));
+                range.insert(x, b_table::ColumnRange::In((start, stop)));
+            }
+            AxisBound::Of(indices) => {
+                return Err(Error::Bounds(format!(
+                    "sparse tensor does not support axis bound {:?}",
+                    indices
+                )));
+            }
+        }
+    }
+
+    Ok(range.into())
 }
