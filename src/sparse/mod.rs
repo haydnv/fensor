@@ -353,12 +353,35 @@ impl<S: fmt::Debug> fmt::Debug for SparseBroadcastAxis<S> {
     }
 }
 
-// TODO: support multiple axes
 #[derive(Clone)]
 pub struct SparseExpand<S> {
     source: S,
     shape: Shape,
-    axis: usize,
+    axes: Vec<usize>,
+}
+
+impl<S: TensorInstance + fmt::Debug> SparseExpand<S> {
+    fn new(source: S, mut axes: Vec<usize>) -> Result<Self, Error> {
+        axes.sort();
+
+        let mut shape = source.shape().to_vec();
+        for x in axes.iter().rev().copied() {
+            shape.insert(x, 1);
+        }
+
+        if Some(source.ndim()) > axes.last().copied() {
+            Ok(Self {
+                source,
+                shape,
+                axes,
+            })
+        } else {
+            Err(Error::Bounds(format!(
+                "cannot expand axes {:?} of {:?}",
+                axes, source
+            )))
+        }
+    }
 }
 
 impl<S: TensorInstance> TensorInstance for SparseExpand<S> {
@@ -375,22 +398,27 @@ impl<S: TensorInstance> TensorInstance for SparseExpand<S> {
 impl<S: SparseInstance> SparseInstance for SparseExpand<S> {
     type DType = S::DType;
 
-    async fn elements(self, mut bounds: Bounds) -> Result<Elements<Self::DType>, Error> {
-        let source_bounds = if bounds.0.len() > self.axis {
-            bounds.0.remove(self.axis);
-            bounds
-        } else {
-            bounds
-        };
+    async fn elements(self, bounds: Bounds) -> Result<Elements<Self::DType>, Error> {
+        let mut source_bounds = bounds;
+        for x in self.axes.iter().rev().copied() {
+            if x < source_bounds.0.len() {
+                source_bounds.0.remove(x);
+            }
+        }
 
-        let axis = self.axis;
         let ndim = self.ndim();
+        let axes = self.axes;
         debug_assert_eq!(self.source.ndim() + 1, ndim);
 
         let source_elements = self.source.elements(source_bounds).await?;
 
-        let elements = source_elements.map_ok(move |(mut coord, value)| {
-            coord.insert(axis, 0);
+        let elements = source_elements.map_ok(move |(source_coord, value)| {
+            let mut coord = Vec::with_capacity(ndim);
+            coord.extend(source_coord);
+            for x in axes.iter().rev().copied() {
+                coord.insert(x, 0);
+            }
+
             debug_assert_eq!(coord.len(), ndim);
             (coord, value)
         });
@@ -401,7 +429,7 @@ impl<S: SparseInstance> SparseInstance for SparseExpand<S> {
 
 impl<S: fmt::Debug> fmt::Debug for SparseExpand<S> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "expand axis {:?} of {:?}", self.axis, self.source)
+        write!(f, "expand axes {:?} of {:?}", self.axes, self.source)
     }
 }
 
