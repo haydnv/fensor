@@ -9,7 +9,6 @@ use b_table::{Range, TableLock};
 use freqfs::DirLock;
 use futures::stream::{Stream, StreamExt, TryStreamExt};
 use ha_ndarray::*;
-use itertools::Itertools;
 use number_general::{DType, Number, NumberCollator, NumberType};
 use rayon::prelude::*;
 use safecast::{AsType, CastInto};
@@ -245,19 +244,22 @@ pub struct SparseBroadcast<S> {
     shape: Shape,
 }
 
-impl<S: TensorInstance> SparseBroadcast<S> {
+impl<S: TensorInstance + fmt::Debug> SparseBroadcast<S> {
     fn new(source: S, shape: Shape) -> Result<Self, Error> {
+        if shape.len() < source.ndim() {
+            return Err(Error::Bounds(format!(
+                "cannot broadcast {:?} into {:?}",
+                source, shape
+            )));
+        }
+
         for (dim, bdim) in source
             .shape()
             .iter()
             .zip(shape.iter().skip(shape.len() - source.ndim()))
         {
-            if dim == bdim {
+            if dim == bdim || *dim == 1 {
                 // pass
-            } else if *dim == 1 {
-                return Err(Error::Bounds(
-                    "cannot broadcast a sparse tensor axis".to_string(),
-                ));
             } else {
                 return Err(Error::Bounds(format!(
                     "cannot broadcast dimension {} into {}",
@@ -287,34 +289,7 @@ impl<S: SparseInstance> SparseInstance for SparseBroadcast<S> {
     async fn elements(
         self,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<(Coord, Self::DType), Error>>>>, Error> {
-        let outer = self
-            .shape
-            .iter()
-            .take(self.ndim() - self.source.ndim())
-            .copied()
-            .map(|dim| 0..dim)
-            .multi_cartesian_product();
-
-        let elements = futures::stream::iter(outer)
-            .then(move |outer_coord| {
-                let source = self.source.clone();
-
-                async move {
-                    let elements = source.elements().await?;
-
-                    let elements = elements.map_ok(move |(inner_coord, value)| {
-                        let mut coord = Vec::with_capacity(outer_coord.len() + inner_coord.len());
-                        coord.extend_from_slice(&outer_coord);
-                        coord.extend(inner_coord);
-                        (coord, value)
-                    });
-
-                    Result::<_, Error>::Ok(elements)
-                }
-            })
-            .try_flatten();
-
-        Ok(Box::pin(elements))
+        todo!()
     }
 }
 
@@ -408,9 +383,7 @@ impl<S: SparseInstance> SparseInstance for SparseReshape<S> {
         let strides = ArrayBase::new(vec![ndim], self.strides)?;
         let shape = ArrayBase::new(vec![ndim], self.shape)?;
 
-        let coord_blocks = stream::BlockCoords::new(source_elements, source_ndim);
-
-        let elements = coord_blocks
+        let elements = stream::BlockCoords::new(source_elements, source_ndim)
             .map(move |result| {
                 let (source_coords, values) = result?;
 
@@ -428,7 +401,7 @@ impl<S: SparseInstance> SparseInstance for SparseReshape<S> {
                     .expand_dims(vec![1])?
                     .broadcast(broadcast.to_vec())?;
 
-                let dims = shape.expand_dims(vec![0])?.broadcast(broadcast.to_vec())?;
+                let dims = shape.expand_dims(vec![0])?.broadcast(broadcast)?;
                 let coords = (offsets / strides) % dims;
 
                 let coords = coords.to_vec(&queue)?;
