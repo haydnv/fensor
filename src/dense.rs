@@ -10,7 +10,9 @@ use ha_ndarray::*;
 use number_general::{DType, NumberClass, NumberInstance, NumberType};
 use safecast::AsType;
 
-use super::{Axes, AxisBound, Bounds, Error, Shape, TensorInstance, IDEAL_BLOCK_SIZE};
+use super::{
+    validate_shape, Axes, AxisBound, Bounds, Error, Shape, TensorInstance, IDEAL_BLOCK_SIZE,
+};
 
 type BlockShape = ha_ndarray::Shape;
 type BlockStream<Block> = Pin<Box<dyn Stream<Item = Result<Block, Error>>>>;
@@ -347,6 +349,78 @@ where
 impl<S: fmt::Debug> fmt::Debug for DenseBroadcast<S> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "broadcast of {:?} into {:?}", self.source, self.shape)
+    }
+}
+
+#[derive(Clone)]
+pub struct DenseReshape<S> {
+    source: S,
+    shape: Shape,
+}
+
+impl<S: TensorInstance> TensorInstance for DenseReshape<S> {
+    fn dtype(&self) -> NumberType {
+        self.source.dtype()
+    }
+
+    fn shape(&self) -> &[u64] {
+        self.source.shape()
+    }
+}
+
+#[async_trait]
+impl<S: DenseInstance> DenseInstance for DenseReshape<S>
+where
+    <S::Block as NDArrayTransform>::Reshape: NDArrayRead<DType = S::DType> + NDArrayTransform,
+{
+    type Block = <S::Block as NDArrayTransform>::Reshape;
+    type DType = S::DType;
+
+    fn block_size(&self) -> usize {
+        self.source.block_size()
+    }
+
+    async fn read_block(&self, block_id: u64) -> Result<Self::Block, Error> {
+        let block_axis = block_axis_for(self.shape(), self.block_size());
+        let mut block_shape = block_shape_for(block_axis, self.shape(), self.block_size());
+
+        let block = self.source.read_block(block_id).await?;
+
+        if block.size() < self.block_size() {
+            // this must be the trailing block
+            let axis_dim = self.block_size() / block_shape.iter().skip(1).product::<usize>();
+            block_shape[0] = axis_dim;
+        }
+
+        block.reshape(block_shape).map_err(Error::from)
+    }
+
+    async fn into_blocks(self) -> Result<BlockStream<Self::Block>, Error> {
+        let block_size = self.block_size();
+        let block_axis = block_axis_for(self.shape(), block_size);
+        let block_shape = block_shape_for(block_axis, self.shape(), block_size);
+
+        let source_blocks = self.source.into_blocks().await?;
+        let blocks = source_blocks.map(move |result| {
+            let block = result?;
+            let mut block_shape = block_shape.to_vec();
+
+            if block.size() < block_size {
+                // this must be the trailing block
+                let axis_dim = block_size / block_shape.iter().skip(1).product::<usize>();
+                block_shape[0] = axis_dim;
+            }
+
+            block.reshape(block_shape).map_err(Error::from)
+        });
+
+        Ok(Box::pin(blocks))
+    }
+}
+
+impl<S: fmt::Debug> fmt::Debug for DenseReshape<S> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "reshape {:?} into {:?}", self.source, self.shape)
     }
 }
 
@@ -796,21 +870,4 @@ fn source_block_id_for(block_map: &ArrayBase<u64>, block_id: u64) -> Result<u64,
         .get(block_id as usize)
         .copied()
         .ok_or_else(|| Error::Bounds(format!("block id {} is out of range", block_id)))
-}
-
-#[inline]
-fn validate_shape(shape: &[u64]) -> Result<(), Error> {
-    if shape.is_empty()
-        || shape
-            .iter()
-            .copied()
-            .any(|dim| dim == 0 || dim > u32::MAX as u64)
-    {
-        Err(Error::Bounds(format!(
-            "invalid shape for dense tensor: {:?}",
-            shape
-        )))
-    } else {
-        Ok(())
-    }
 }

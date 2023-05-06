@@ -142,3 +142,20 @@ fn strides_for(shape: &[u64], ndim: usize) -> Strides {
 
     zeros.chain(strides).collect()
 }
+
+#[inline]
+fn validate_shape(shape: &[u64]) -> Result<(), Error> {
+    if shape.is_empty()
+        || shape
+            .iter()
+            .copied()
+            .any(|dim| dim == 0 || dim > u32::MAX as u64)
+    {
+        Err(Error::Bounds(format!(
+            "invalid shape for dense tensor: {:?}",
+            shape
+        )))
+    } else {
+        Ok(())
+    }
+}
