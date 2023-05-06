@@ -1,7 +1,6 @@
-use core::fmt;
-use std::io;
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::{fmt, io};
 
 use async_trait::async_trait;
 use destream::de;
@@ -11,7 +10,7 @@ use ha_ndarray::*;
 use number_general::{DType, NumberClass, NumberInstance, NumberType};
 use safecast::AsType;
 
-use super::{Error, Shape, TensorInstance, IDEAL_BLOCK_SIZE};
+use super::{Axes, Error, Shape, TensorInstance, IDEAL_BLOCK_SIZE};
 
 type BlockShape = ha_ndarray::Shape;
 type BlockStream<Block> = Pin<Box<dyn Stream<Item = Result<Block, Error>>>>;
@@ -111,9 +110,11 @@ decode_array!(f32, "32-bit int array", decode_array_f32, visit_array_f32);
 decode_array!(f64, "64-bit int array", decode_array_f64, visit_array_f64);
 
 #[async_trait]
-pub trait DenseInstance: fmt::Debug + Send + Sync + 'static {
+pub trait DenseInstance: TensorInstance + fmt::Debug + Send + Sync + 'static {
     type Block: NDArrayRead<DType = Self::DType> + NDArrayTransform;
     type DType: CDatatype + DType;
+
+    fn block_size(&self) -> usize;
 
     async fn read_block(&self, block_id: u64) -> Result<Self::Block, Error>;
 
@@ -232,6 +233,10 @@ where
     type Block = ArrayBase<T>;
     type DType = T;
 
+    fn block_size(&self) -> usize {
+        self.block_size
+    }
+
     async fn read_block(&self, block_id: u64) -> Result<Self::Block, Error> {
         let dir = self.dir.read().await;
         let file = dir.get_file(&block_id).ok_or_else(|| {
@@ -305,6 +310,10 @@ where
     type Block = <S::Block as NDArrayTransform>::Broadcast;
     type DType = S::DType;
 
+    fn block_size(&self) -> usize {
+        self.block_size
+    }
+
     async fn read_block(&self, block_id: u64) -> Result<Self::Block, Error> {
         let source_block_id = self
             .block_map
@@ -348,6 +357,144 @@ where
 impl<S: fmt::Debug> fmt::Debug for DenseBroadcast<S> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "broadcast of {:?} into {:?}", self.source, self.shape)
+    }
+}
+
+pub struct DenseTranspose<S> {
+    source: S,
+    shape: Shape,
+    permutation: Axes,
+    block_map: ArrayBase<u64>,
+}
+
+impl<S: DenseInstance> DenseTranspose<S> {
+    fn new(source: S, permutation: Option<Axes>) -> Result<Self, Error> {
+        let permutation = if let Some(axes) = permutation {
+            if axes.len() == source.ndim()
+                && (0..source.ndim()).into_iter().all(|x| axes.contains(&x))
+            {
+                Ok(axes)
+            } else {
+                Err(Error::Bounds(format!(
+                    "invalid permutation for {:?}: {:?}",
+                    source, axes
+                )))
+            }
+        } else {
+            Ok((0..source.ndim()).into_iter().rev().collect())
+        }?;
+
+        let shape = permutation
+            .iter()
+            .copied()
+            .map(|x| source.shape()[x])
+            .collect();
+
+        let num_blocks = div_ceil(source.size(), source.block_size() as u64);
+        let block_axis = block_axis_for(source.shape(), source.block_size());
+
+        let map_shape = source
+            .shape()
+            .iter()
+            .take(block_axis)
+            .copied()
+            .map(|dim| dim as usize)
+            .collect();
+
+        let (map_axes, permutation) = permutation.split_at(block_axis);
+
+        if map_axes.iter().copied().any(|x| x >= block_axis)
+            || permutation.iter().copied().any(|x| x <= block_axis)
+        {
+            return Err(Error::Bounds(format!(
+                "cannot transpose axes {:?} of {:?} without copying",
+                permutation, source
+            )));
+        }
+
+        let block_map = ArrayBase::new(map_shape, (0..num_blocks).into_iter().collect())?;
+        let block_map = block_map.transpose(Some(map_axes.to_vec()))?;
+        let block_map = ArrayBase::copy(&block_map)?;
+
+        Ok(Self {
+            source,
+            shape,
+            permutation: permutation.to_vec(),
+            block_map,
+        })
+    }
+}
+
+impl<S: TensorInstance> TensorInstance for DenseTranspose<S> {
+    fn dtype(&self) -> NumberType {
+        self.source.dtype()
+    }
+
+    fn shape(&self) -> &[u64] {
+        self.source.shape()
+    }
+}
+
+#[async_trait]
+impl<S: DenseInstance + Clone> DenseInstance for DenseTranspose<S>
+where
+    <S::Block as NDArrayTransform>::Transpose: NDArrayRead<DType = S::DType> + NDArrayTransform,
+{
+    type Block = <S::Block as NDArrayTransform>::Transpose;
+    type DType = S::DType;
+
+    fn block_size(&self) -> usize {
+        self.source.block_size()
+    }
+
+    async fn read_block(&self, block_id: u64) -> Result<Self::Block, Error> {
+        let source_block_id = self
+            .block_map
+            .as_slice()
+            .get(block_id as usize)
+            .copied()
+            .ok_or_else(|| {
+                Error::Bounds(format!(
+                    "block {} is out of bounds for {:?}",
+                    block_id, self
+                ))
+            })?;
+
+        let block = self.source.read_block(source_block_id).await?;
+
+        block
+            .transpose(Some(self.permutation.to_vec()))
+            .map_err(Error::from)
+    }
+
+    async fn blocks(self) -> Result<BlockStream<Self::Block>, Error> {
+        let permutation = self.permutation;
+
+        let blocks = stream::iter(self.block_map.into_data())
+            .map(move |block_id| {
+                let source = self.source.clone();
+                async move { source.read_block(block_id).await }
+            })
+            .buffered(num_cpus::get())
+            .map(move |result| {
+                let block = result?;
+
+                block
+                    .transpose(Some(permutation.to_vec()))
+                    .map_err(Error::from)
+            });
+
+        Ok(Box::pin(blocks))
+    }
+}
+
+impl<S: fmt::Debug> fmt::Debug for DenseTranspose<S> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "transpose axes {:?} of {:?}",
+            self.permutation, self.source
+        )
     }
 }
 
