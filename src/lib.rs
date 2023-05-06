@@ -84,15 +84,15 @@ pub trait TensorTransform: TensorInstance {
     type Slice: TensorInstance;
     type Transpose: TensorInstance;
 
-    fn broadcast(&self, shape: Shape) -> Result<Self::Broadcast, Error>;
+    fn broadcast(self, shape: Shape) -> Result<Self::Broadcast, Error>;
 
-    fn expand(&self, axes: Axes) -> Result<Self::Expand, Error>;
+    fn expand(self, axes: Axes) -> Result<Self::Expand, Error>;
 
-    fn reshape(&self, shape: Shape) -> Result<Self::Reshape, Error>;
+    fn reshape(self, shape: Shape) -> Result<Self::Reshape, Error>;
 
-    fn slice(&self, bounds: Bounds) -> Result<Self::Slice, Error>;
+    fn slice(self, bounds: Bounds) -> Result<Self::Slice, Error>;
 
-    fn transpose(&self, axes: Axes) -> Result<Self::Transpose, Error>;
+    fn transpose(self, axes: Axes) -> Result<Self::Transpose, Error>;
 }
 
 #[inline]

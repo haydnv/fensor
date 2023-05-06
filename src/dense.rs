@@ -1,9 +1,12 @@
+use core::fmt;
+use std::io;
 use std::marker::PhantomData;
+use std::pin::Pin;
 
 use async_trait::async_trait;
 use destream::de;
-use freqfs::{DirLock, FileLoad, FileLock};
-use futures::future::{FutureExt, TryFutureExt};
+use freqfs::{DirLock, FileLoad};
+use futures::{stream, Stream, StreamExt, TryStreamExt};
 use ha_ndarray::*;
 use number_general::{DType, NumberClass, NumberInstance, NumberType};
 use safecast::AsType;
@@ -11,6 +14,7 @@ use safecast::AsType;
 use super::{Error, Shape, TensorInstance, IDEAL_BLOCK_SIZE};
 
 type BlockShape = ha_ndarray::Shape;
+type BlockStream<Block> = Pin<Box<dyn Stream<Item = Result<Block, Error>>>>;
 
 pub struct Array<T> {
     data: Vec<T>,
@@ -107,63 +111,22 @@ decode_array!(f32, "32-bit int array", decode_array_f32, visit_array_f32);
 decode_array!(f64, "64-bit int array", decode_array_f64, visit_array_f64);
 
 #[async_trait]
-pub trait Block: Send + Sync + 'static {
-    type Array: NDArrayRead;
-
-    async fn into_read(self) -> Result<Self::Array, Error>;
-}
-
-pub struct DenseBlock<FE, T> {
-    shape: BlockShape,
-    file: FileLock<FE>,
-    dtype: PhantomData<T>,
-}
-
-impl<FE, T> Clone for DenseBlock<FE, T> {
-    fn clone(&self) -> Self {
-        Self {
-            shape: self.shape.to_vec(),
-            file: self.file.clone(),
-            dtype: PhantomData,
-        }
-    }
-}
-
-#[async_trait]
-impl<FE, T> Block for DenseBlock<FE, T>
-where
-    FE: FileLoad + AsType<Array<T>>,
-    T: CDatatype + DType,
-    Array<T>: de::FromStream<Context = ()>,
-{
-    type Array = ArrayBase<T>;
-
-    async fn into_read(self) -> Result<Self::Array, Error> {
-        self.file
-            .into_read()
-            .map(|result| {
-                result.map_err(Error::from).and_then(|array| {
-                    ArrayBase::new(self.shape, array.data.to_vec()).map_err(Error::from)
-                })
-            })
-            .map_err(Error::from)
-            .await
-    }
-}
-
-pub trait DenseInstance {
-    type Block: Block;
+pub trait DenseInstance: fmt::Debug + Send + Sync + 'static {
+    type Block: NDArrayRead<DType = Self::DType> + NDArrayTransform;
     type DType: CDatatype + DType;
 
-    fn into_blocks(self) -> Vec<Self::Block>;
+    async fn read_block(&self, block_id: u64) -> Result<Self::Block, Error>;
+
+    async fn blocks(self) -> Result<BlockStream<Self::Block>, Error>;
 }
 
 #[derive(Clone)]
 pub struct DenseFile<FE, T> {
     dir: DirLock<FE>,
     block_map: ArrayBase<u64>,
-    blocks: Vec<DenseBlock<FE, T>>,
+    block_size: usize,
     shape: Shape,
+    dtype: PhantomData<T>,
 }
 
 impl<FE, T> DenseFile<FE, T>
@@ -195,56 +158,34 @@ where
         };
 
         debug_assert!(block_size > 0);
-        let block_axis = block_axis_for(&shape, block_size);
 
-        let blocks = {
+        {
             let dtype_size = T::dtype().size();
-            let mut blocks = Vec::with_capacity(num_blocks);
+
             let mut dir = dir.write().await;
-            for block_id in 0..(num_blocks - 1) {
-                let file = dir.create_file(
+
+            for block_id in 0..num_blocks {
+                dir.create_file(
                     block_id.to_string(),
                     vec![value; block_size].into(),
                     block_size * dtype_size,
                 )?;
-
-                let block_shape = block_shape_for(block_axis, &shape, block_size);
-
-                blocks.push(DenseBlock {
-                    file,
-                    shape: block_shape,
-                    dtype: PhantomData,
-                });
             }
 
             let last_block_id = num_blocks - 1;
-            let (last_file, last_block_size) = if size % block_size as u64 == 0 {
-                let file = dir.create_file(
+            if size % block_size as u64 == 0 {
+                dir.create_file(
                     last_block_id.to_string(),
                     vec![value; block_size].into(),
                     block_size * dtype_size,
-                )?;
-
-                (file, block_size)
+                )
             } else {
-                let block_size = (size % block_size as u64) as usize;
-
-                let file = dir.create_file(
+                dir.create_file(
                     last_block_id.to_string(),
                     vec![value; block_size].into(),
                     block_size * dtype_size,
-                )?;
-
-                (file, block_size)
-            };
-
-            blocks.push(DenseBlock {
-                file: last_file,
-                shape: block_shape_for(block_axis, &shape, last_block_size),
-                dtype: PhantomData,
-            });
-
-            blocks
+                )
+            }?;
         };
 
         let block_axis = block_axis_for(&shape, block_size);
@@ -260,8 +201,9 @@ where
         Ok(Self {
             dir,
             block_map,
-            blocks,
+            block_size,
             shape,
+            dtype: PhantomData,
         })
     }
 }
@@ -280,50 +222,74 @@ where
     }
 }
 
+#[async_trait]
 impl<FE, T> DenseInstance for DenseFile<FE, T>
 where
     FE: FileLoad + AsType<Array<T>>,
     T: CDatatype + DType + 'static,
     Array<T>: de::FromStream<Context = ()>,
 {
-    type Block = DenseBlock<FE, T>;
+    type Block = ArrayBase<T>;
     type DType = T;
 
-    fn into_blocks(self) -> Vec<Self::Block> {
-        self.blocks
+    async fn read_block(&self, block_id: u64) -> Result<Self::Block, Error> {
+        let dir = self.dir.read().await;
+        let file = dir.get_file(&block_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("dense tensor block {}", block_id),
+            )
+        })?;
+
+        let array = file.read().await?;
+        let block_axis = block_axis_for(self.shape(), self.block_size);
+        let block_shape = block_shape_for(block_axis, &self.shape, array.data.len());
+        ArrayBase::new(block_shape, array.data.to_vec()).map_err(Error::from)
+    }
+
+    async fn blocks(self) -> Result<BlockStream<Self::Block>, Error> {
+        let shape = self.shape;
+        let block_axis = block_axis_for(&shape, self.block_size);
+        let dir = self.dir.into_read().await;
+
+        let blocks = stream::iter(self.block_map.into_data())
+            .map(move |block_id| {
+                dir.get_file(&block_id).cloned().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("dense tensor block {}", block_id),
+                    )
+                    .into()
+                })
+            })
+            .map_ok(|block| block.into_read())
+            .try_buffered(num_cpus::get())
+            .map(move |result| {
+                let array = result?;
+                let block_shape = block_shape_for(block_axis, &shape, array.data.len());
+                ArrayBase::new(block_shape, array.data.to_vec()).map_err(Error::from)
+            });
+
+        Ok(Box::pin(blocks))
     }
 }
 
-#[derive(Clone)]
-pub struct DenseView<B> {
-    blocks: Vec<B>,
-    block_map: ArrayBase<u64>,
+impl<FE, T> fmt::Debug for DenseFile<FE, T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "dense tensor with shape {:?}", self.shape)
+    }
+}
+
+pub struct DenseBroadcast<S> {
+    source: S,
     shape: Shape,
+    block_map: ArrayBase<u64>,
+    block_size: usize,
 }
 
-impl<B> DenseView<B> {
-    fn new(blocks: Vec<B>, block_map: ArrayBase<u64>, shape: Shape) -> Self {
-        debug_assert!(block_map.ndim() <= shape.len());
-        debug_assert!(block_map
-            .as_slice()
-            .iter()
-            .copied()
-            .all(|block_id| block_id < blocks.len() as u64));
-
-        Self {
-            blocks,
-            block_map,
-            shape,
-        }
-    }
-}
-
-impl<B: Block> TensorInstance for DenseView<B>
-where
-    <B::Array as NDArray>::DType: DType,
-{
+impl<S: TensorInstance> TensorInstance for DenseBroadcast<S> {
     fn dtype(&self) -> NumberType {
-        <B::Array as NDArray>::DType::dtype()
+        self.source.dtype()
     }
 
     fn shape(&self) -> &[u64] {
@@ -331,15 +297,57 @@ where
     }
 }
 
-impl<B: Block> DenseInstance for DenseView<B>
+#[async_trait]
+impl<S: DenseInstance + Clone> DenseInstance for DenseBroadcast<S>
 where
-    <B::Array as NDArray>::DType: DType,
+    <S::Block as NDArrayTransform>::Broadcast: NDArrayRead<DType = S::DType> + NDArrayTransform,
 {
-    type Block = B;
-    type DType = <B::Array as NDArray>::DType;
+    type Block = <S::Block as NDArrayTransform>::Broadcast;
+    type DType = S::DType;
 
-    fn into_blocks(self) -> Vec<Self::Block> {
-        self.blocks
+    async fn read_block(&self, block_id: u64) -> Result<Self::Block, Error> {
+        let source_block_id = self
+            .block_map
+            .as_slice()
+            .get(block_id as usize)
+            .copied()
+            .ok_or_else(|| {
+                Error::Bounds(format!(
+                    "block {} is out of bounds for {:?}",
+                    block_id, self
+                ))
+            })?;
+
+        let block_axis = block_axis_for(&self.shape, self.block_size);
+        let block_shape = block_shape_for(block_axis, &self.shape, self.block_size);
+        let source_block = self.source.read_block(source_block_id).await?;
+        source_block.broadcast(block_shape).map_err(Error::from)
+    }
+
+    async fn blocks(self) -> Result<BlockStream<Self::Block>, Error> {
+        let block_axis = block_axis_for(&self.shape, self.block_size);
+        let block_shape = block_shape_for(block_axis, &self.shape, self.block_size);
+
+        let blocks = stream::iter(self.block_map.into_data())
+            .map(move |block_id| {
+                let source = self.source.clone();
+                async move { source.read_block(block_id).await }
+            })
+            .buffered(num_cpus::get())
+            .map(move |result| {
+                let source_block = result?;
+                source_block
+                    .broadcast(block_shape.to_vec())
+                    .map_err(Error::from)
+            });
+
+        Ok(Box::pin(blocks))
+    }
+}
+
+impl<S: fmt::Debug> fmt::Debug for DenseBroadcast<S> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "broadcast of {:?} into {:?}", self.source, self.shape)
     }
 }
 
