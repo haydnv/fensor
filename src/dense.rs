@@ -107,7 +107,7 @@ decode_array!(f32, "32-bit int array", decode_array_f32, visit_array_f32);
 decode_array!(f64, "64-bit int array", decode_array_f64, visit_array_f64);
 
 #[async_trait]
-pub trait Block {
+pub trait Block: Send + Sync + 'static {
     type Array: NDArrayRead;
 
     async fn into_read(self) -> Result<Self::Array, Error>;
@@ -288,6 +288,55 @@ where
 {
     type Block = DenseBlock<FE, T>;
     type DType = T;
+
+    fn into_blocks(self) -> Vec<Self::Block> {
+        self.blocks
+    }
+}
+
+#[derive(Clone)]
+pub struct DenseView<B> {
+    blocks: Vec<B>,
+    block_map: ArrayBase<u64>,
+    shape: Shape,
+}
+
+impl<B> DenseView<B> {
+    fn new(blocks: Vec<B>, block_map: ArrayBase<u64>, shape: Shape) -> Self {
+        debug_assert!(block_map.ndim() <= shape.len());
+        debug_assert!(block_map
+            .as_slice()
+            .iter()
+            .copied()
+            .all(|block_id| block_id < blocks.len() as u64));
+
+        Self {
+            blocks,
+            block_map,
+            shape,
+        }
+    }
+}
+
+impl<B: Block> TensorInstance for DenseView<B>
+where
+    <B::Array as NDArray>::DType: DType,
+{
+    fn dtype(&self) -> NumberType {
+        <B::Array as NDArray>::DType::dtype()
+    }
+
+    fn shape(&self) -> &[u64] {
+        &self.shape
+    }
+}
+
+impl<B: Block> DenseInstance for DenseView<B>
+where
+    <B::Array as NDArray>::DType: DType,
+{
+    type Block = B;
+    type DType = <B::Array as NDArray>::DType;
 
     fn into_blocks(self) -> Vec<Self::Block> {
         self.blocks
