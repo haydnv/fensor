@@ -15,7 +15,7 @@ use number_general::{DType, Number, NumberCollator, NumberType};
 use rayon::prelude::*;
 use safecast::{AsType, CastInto};
 
-use super::{AxisBound, Bounds, Coord, Error, Shape, TensorInstance};
+use super::{strides_for, Axes, AxisBound, Bounds, Coord, Error, Shape, Strides, TensorInstance};
 
 mod stream;
 
@@ -26,11 +26,11 @@ pub type Node = b_table::b_tree::Node<Vec<Vec<Number>>>;
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct IndexSchema {
-    columns: Vec<usize>,
+    columns: Axes,
 }
 
 impl IndexSchema {
-    pub fn new(columns: Vec<usize>) -> Self {
+    pub fn new(columns: Axes) -> Self {
         Self { columns }
     }
 }
@@ -181,7 +181,7 @@ pub trait SparseInstance: TensorInstance + fmt::Debug {
     async fn filled_at(
         self,
         bounds: Bounds,
-        axes: Vec<usize>,
+        axes: Axes,
     ) -> Result<stream::FilledAt<Elements<Self::DType>>, Error>
     where
         Self: Sized,
@@ -380,11 +380,11 @@ impl<S: fmt::Debug> fmt::Debug for SparseBroadcastAxis<S> {
 pub struct SparseExpand<S> {
     source: S,
     shape: Shape,
-    axes: Vec<usize>,
+    axes: Axes,
 }
 
 impl<S: TensorInstance + fmt::Debug> SparseExpand<S> {
-    fn new(source: S, mut axes: Vec<usize>) -> Result<Self, Error> {
+    fn new(source: S, mut axes: Axes) -> Result<Self, Error> {
         axes.sort();
 
         let mut shape = source.shape().to_vec();
@@ -468,9 +468,9 @@ impl<S: fmt::Debug> fmt::Debug for SparseExpand<S> {
 #[derive(Clone)]
 pub struct SparseReshape<S> {
     source: S,
-    source_strides: Vec<u64>,
+    source_strides: Strides,
     shape: Shape,
-    strides: Vec<u64>,
+    strides: Strides,
 }
 
 impl<S: TensorInstance> SparseReshape<S> {
@@ -560,7 +560,7 @@ impl<S: SparseInstance> SparseInstance for SparseReshape<S> {
         let elements = blocks
             .map(move |result| {
                 let (coords, values) = result?;
-                let coords = coords.to_vec(&queue)?;
+                let coords = coords.into_data();
                 let values = values.to_vec(&queue)?;
                 let coords = coords.into_par_iter().chunks(ndim).collect::<Vec<Coord>>();
 
@@ -749,7 +749,7 @@ impl<S: fmt::Debug> fmt::Debug for SparseSlice<S> {
 #[derive(Clone)]
 pub struct SparseTranspose<S> {
     source: S,
-    permutation: Vec<usize>,
+    permutation: Axes,
     shape: Shape,
 }
 
@@ -821,7 +821,7 @@ where
         let elements = blocks
             .map(move |result| {
                 let (coords, values) = result?;
-                let coords = coords.to_vec(&queue)?;
+                let coords = coords.into_data();
                 let values = values.to_vec(&queue)?;
                 let elements = coords
                     .into_par_iter()
@@ -850,23 +850,6 @@ impl<S: fmt::Debug> fmt::Debug for SparseTranspose<S> {
 #[inline]
 fn size_hint(size: u64) -> usize {
     size.try_into().ok().unwrap_or_else(|| usize::MAX)
-}
-
-#[inline]
-fn strides_for(shape: &[u64], ndim: usize) -> Vec<u64> {
-    debug_assert!(ndim >= shape.len());
-
-    let zeros = std::iter::repeat(0).take(ndim - shape.len());
-
-    let strides = shape.iter().enumerate().map(|(x, dim)| {
-        if *dim == 1 {
-            0
-        } else {
-            shape.iter().rev().take(shape.len() - 1 - x).product()
-        }
-    });
-
-    zeros.chain(strides).collect()
 }
 
 #[inline]

@@ -1,17 +1,26 @@
+use std::io;
 use std::marker::PhantomData;
 
 use async_trait::async_trait;
 use destream::de;
 use freqfs::{DirLock, FileLoad};
-use futures::stream::{self, Stream, StreamExt, TryStreamExt};
+use futures::stream::{self, Stream, StreamExt};
 use ha_ndarray::*;
-use number_general::{DType, NumberType};
+use number_general::{DType, NumberClass, NumberInstance, NumberType};
 use safecast::AsType;
 
 use super::{Error, Shape, TensorInstance, IDEAL_BLOCK_SIZE};
 
+type BlockShape = ha_ndarray::Shape;
+
 pub struct Array<T> {
     data: Vec<T>,
+}
+
+impl<T> From<Vec<T>> for Array<T> {
+    fn from(data: Vec<T>) -> Self {
+        Self { data }
+    }
 }
 
 struct ArrayVisitor<T> {
@@ -106,20 +115,97 @@ trait DenseInstance {
 }
 
 pub struct DenseFile<FE, T> {
-    axis: usize,
+    file: DirLock<FE>,
+    block_size: usize,
+    block_map: ArrayBase<u64>,
     shape: Shape,
-    blocks: DirLock<FE>,
     dtype: PhantomData<T>,
 }
 
 impl<FE, T> Clone for DenseFile<FE, T> {
     fn clone(&self) -> Self {
+        // TODO: can DenseFile::clone be zero-alloc?
         Self {
-            axis: self.axis,
+            file: self.file.clone(),
+            block_size: self.block_size,
+            block_map: self.block_map.clone(),
             shape: self.shape.to_vec(),
-            blocks: self.blocks.clone(),
             dtype: PhantomData,
         }
+    }
+}
+
+impl<FE, T> DenseFile<FE, T>
+where
+    FE: AsType<Array<T>> + Send + Sync,
+    T: CDatatype + DType + NumberInstance,
+{
+    pub async fn create(file: DirLock<FE>, shape: Shape) -> Result<Self, Error> {
+        let size = shape.iter().product();
+
+        let (block_size, num_blocks) = if size < (2 * IDEAL_BLOCK_SIZE) as u64 {
+            (size as usize, 1)
+        } else if shape.len() == 1 && size % IDEAL_BLOCK_SIZE as u64 == 0 {
+            (IDEAL_BLOCK_SIZE, (size / IDEAL_BLOCK_SIZE as u64) as usize)
+        } else if shape.len() == 1
+            || (shape.iter().rev().take(2).product::<u64>() > (2 * IDEAL_BLOCK_SIZE as u64))
+        {
+            let num_blocks = div_ceil(size, IDEAL_BLOCK_SIZE as u64) as usize;
+            (IDEAL_BLOCK_SIZE, num_blocks as usize)
+        } else {
+            let matrix_size = shape.iter().rev().take(2).product::<u64>();
+            let block_size =
+                IDEAL_BLOCK_SIZE as u64 + (matrix_size - (IDEAL_BLOCK_SIZE as u64 % matrix_size));
+            let num_blocks = div_ceil(size, IDEAL_BLOCK_SIZE as u64);
+            (block_size as usize, num_blocks as usize)
+        };
+
+        debug_assert!(block_size > 0);
+
+        {
+            let zero = T::zero();
+            let dtype_size = T::dtype().size();
+            let mut blocks = file.write().await;
+            for block_id in 0..(num_blocks - 1) {
+                blocks.create_file(
+                    block_id.to_string(),
+                    vec![zero; block_size].into(),
+                    block_size * dtype_size,
+                )?;
+            }
+
+            if size % block_size as u64 == 0 {
+                blocks.create_file(
+                    (num_blocks - 1).to_string(),
+                    vec![zero; block_size].into(),
+                    block_size * dtype_size,
+                )?;
+            } else {
+                blocks.create_file(
+                    (num_blocks - 1).to_string(),
+                    vec![zero; block_size].into(),
+                    block_size * dtype_size,
+                )?;
+            }
+        }
+
+        let block_axis = block_axis_for(&shape, block_size);
+        let map_shape = shape
+            .iter()
+            .take(block_axis)
+            .copied()
+            .map(|dim| dim as usize)
+            .collect();
+
+        let block_map = ArrayBase::new(map_shape, (0u64..num_blocks as u64).into_iter().collect())?;
+
+        Ok(Self {
+            file,
+            block_size,
+            block_map,
+            shape,
+            dtype: PhantomData,
+        })
     }
 }
 
@@ -147,33 +233,46 @@ where
     type Block = ArrayBase<T>;
 
     async fn blocks(self) -> Result<Box<dyn Stream<Item = Result<Self::Block, Error>>>, Error> {
-        let dir = self.blocks.read().await;
+        let file = self.file.read().await;
 
-        let block_reads = dir
-            .files()
-            .cloned()
-            .map(|file| file.into_read())
-            .collect::<Vec<_>>();
+        let block_reads = self
+            .block_map
+            .as_slice()
+            .iter()
+            .map(|block_id| {
+                file.get_file(block_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("dense tensor block {}", block_id),
+                        )
+                    })
+                    .map(|file| file.into_read())
+                    .map_err(Error::from)
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        let block_axis = block_axis_for(&self.shape, self.block_size);
 
         let blocks = stream::iter(block_reads)
             .buffered(num_cpus::get())
-            .map_err(Error::from)
-            .map(move |array| {
-                let array = array?;
-                let block_size = self.shape.iter().rev().take(self.axis).product::<u64>() as usize;
+            .map(move |result| {
+                let array = result?;
+                let block_size = self.shape.iter().rev().take(block_axis).product::<u64>() as usize;
 
-                let block_shape = if self.axis == self.shape.len() - 1 {
+                let block_shape = if block_axis == self.shape.len() - 1 {
                     vec![array.data.len()]
                 } else {
                     let axis_dim = array.data.len() / block_size;
                     debug_assert_eq!(array.data.len() % axis_dim, 0);
 
-                    let mut shape = Vec::with_capacity(self.shape.len() - self.axis + 1);
+                    let mut shape = Vec::with_capacity(self.shape.len() - block_axis + 1);
                     shape.push(axis_dim);
                     shape.extend(
                         self.shape
                             .iter()
-                            .skip(self.axis)
+                            .skip(block_axis)
                             .copied()
                             .map(|dim| dim as usize),
                     );
@@ -185,5 +284,35 @@ where
             });
 
         Ok(Box::new(blocks))
+    }
+}
+
+#[inline]
+fn block_axis_for(shape: &[u64], block_size: usize) -> usize {
+    debug_assert!(!shape.is_empty());
+    debug_assert!(shape.iter().copied().all(|dim| dim > 0));
+    debug_assert!(shape.iter().product::<u64>() >= block_size as u64);
+
+    let mut block_ndim = 1;
+    let mut size = 1;
+    for dim in shape.iter().rev() {
+        size *= dim;
+
+        if size > block_size as u64 {
+            break;
+        } else {
+            block_ndim += 1;
+        }
+    }
+
+    shape.len() - block_ndim
+}
+
+#[inline]
+fn div_ceil(num: u64, denom: u64) -> u64 {
+    if num % denom == 0 {
+        num / denom
+    } else {
+        (num / denom) + 1
     }
 }

@@ -5,9 +5,15 @@ use number_general::NumberType;
 pub mod dense;
 pub mod sparse;
 
+pub type Axes = Vec<usize>;
 pub type Coord = Vec<u64>;
 pub type Shape = Vec<u64>;
+pub type Strides = Vec<u64>;
 
+#[cfg(debug_assertions)]
+const IDEAL_BLOCK_SIZE: usize = 24;
+
+#[cfg(not(debug_assertions))]
 const IDEAL_BLOCK_SIZE: usize = 65_536;
 
 #[derive(Clone, Debug)]
@@ -80,11 +86,28 @@ pub trait TensorTransform: TensorInstance {
 
     fn broadcast(&self, shape: Shape) -> Result<Self::Broadcast, Error>;
 
-    fn expand(&self, axes: Vec<usize>) -> Result<Self::Expand, Error>;
+    fn expand(&self, axes: Axes) -> Result<Self::Expand, Error>;
 
     fn reshape(&self, shape: Shape) -> Result<Self::Reshape, Error>;
 
     fn slice(&self, bounds: Bounds) -> Result<Self::Slice, Error>;
 
-    fn transpose(&self, axes: Vec<usize>) -> Result<Self::Transpose, Error>;
+    fn transpose(&self, axes: Axes) -> Result<Self::Transpose, Error>;
+}
+
+#[inline]
+fn strides_for(shape: &[u64], ndim: usize) -> Strides {
+    debug_assert!(ndim >= shape.len());
+
+    let zeros = std::iter::repeat(0).take(ndim - shape.len());
+
+    let strides = shape.iter().enumerate().map(|(x, dim)| {
+        if *dim == 1 {
+            0
+        } else {
+            shape.iter().rev().take(shape.len() - 1 - x).product()
+        }
+    });
+
+    zeros.chain(strides).collect()
 }
