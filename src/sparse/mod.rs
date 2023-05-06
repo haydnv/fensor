@@ -445,7 +445,7 @@ impl<S: SparseInstance> SparseInstance for SparseExpand<S> {
         let source_elements = self.source.elements(source_bounds).await?;
 
         let elements = source_elements.map_ok(move |(source_coord, value)| {
-            let mut coord = Vec::with_capacity(ndim);
+            let mut coord = Coord::with_capacity(ndim);
             coord.extend(source_coord);
             for x in axes.iter().rev().copied() {
                 coord.insert(x, 0);
@@ -599,7 +599,7 @@ where
             )));
         }
 
-        let mut shape = Vec::with_capacity(source.ndim());
+        let mut shape = Shape::with_capacity(source.ndim());
         for (x, bound) in bounds.0.iter().enumerate() {
             match bound {
                 AxisBound::At(_) => {} // no-op
