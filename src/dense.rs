@@ -10,7 +10,7 @@ use ha_ndarray::*;
 use number_general::{DType, NumberClass, NumberInstance, NumberType};
 use safecast::AsType;
 
-use super::{Axes, Error, Shape, TensorInstance, IDEAL_BLOCK_SIZE};
+use super::{Axes, AxisBound, Bounds, Error, Shape, TensorInstance, IDEAL_BLOCK_SIZE};
 
 type BlockShape = ha_ndarray::Shape;
 type BlockStream<Block> = Pin<Box<dyn Stream<Item = Result<Block, Error>>>>;
@@ -118,7 +118,7 @@ pub trait DenseInstance: TensorInstance + fmt::Debug + Send + Sync + 'static {
 
     async fn read_block(&self, block_id: u64) -> Result<Self::Block, Error>;
 
-    async fn blocks(self) -> Result<BlockStream<Self::Block>, Error>;
+    async fn into_blocks(self) -> Result<BlockStream<Self::Block>, Error>;
 }
 
 #[derive(Clone)]
@@ -252,7 +252,7 @@ where
         ArrayBase::new(block_shape, array.data.to_vec()).map_err(Error::from)
     }
 
-    async fn blocks(self) -> Result<BlockStream<Self::Block>, Error> {
+    async fn into_blocks(self) -> Result<BlockStream<Self::Block>, Error> {
         let shape = self.shape;
         let block_axis = block_axis_for(&shape, self.block_size);
         let dir = self.dir.into_read().await;
@@ -285,6 +285,7 @@ impl<FE, T> fmt::Debug for DenseFile<FE, T> {
     }
 }
 
+#[derive(Clone)]
 pub struct DenseBroadcast<S> {
     source: S,
     shape: Shape,
@@ -315,25 +316,14 @@ where
     }
 
     async fn read_block(&self, block_id: u64) -> Result<Self::Block, Error> {
-        let source_block_id = self
-            .block_map
-            .as_slice()
-            .get(block_id as usize)
-            .copied()
-            .ok_or_else(|| {
-                Error::Bounds(format!(
-                    "block {} is out of bounds for {:?}",
-                    block_id, self
-                ))
-            })?;
-
+        let source_block_id = source_block_id_for(&self.block_map, block_id)?;
         let block_axis = block_axis_for(&self.shape, self.block_size);
         let block_shape = block_shape_for(block_axis, &self.shape, self.block_size);
         let source_block = self.source.read_block(source_block_id).await?;
         source_block.broadcast(block_shape).map_err(Error::from)
     }
 
-    async fn blocks(self) -> Result<BlockStream<Self::Block>, Error> {
+    async fn into_blocks(self) -> Result<BlockStream<Self::Block>, Error> {
         let block_axis = block_axis_for(&self.shape, self.block_size);
         let block_shape = block_shape_for(block_axis, &self.shape, self.block_size);
 
@@ -360,6 +350,271 @@ impl<S: fmt::Debug> fmt::Debug for DenseBroadcast<S> {
     }
 }
 
+#[derive(Clone)]
+pub struct DenseSlice<S> {
+    source: S,
+    bounds: Bounds,
+    shape: Shape,
+    block_map: ArrayBase<u64>,
+    block_size: usize,
+}
+
+impl<S: DenseInstance> DenseSlice<S> {
+    fn new(source: S, bounds: Bounds) -> Result<Self, Error> {
+        if bounds.0.len() > source.ndim() {
+            return Err(Error::Bounds(format!(
+                "invalid bounds for {:?}: {:?}",
+                source, bounds
+            )));
+        }
+
+        let block_axis = block_axis_for(source.shape(), source.block_size());
+        let block_shape = block_shape_for(block_axis, source.shape(), source.block_size());
+        let num_blocks = div_ceil(
+            source.size() as u64,
+            block_shape.iter().product::<usize>() as u64,
+        ) as usize;
+
+        let block_map_shape = source
+            .shape()
+            .iter()
+            .take(block_axis)
+            .copied()
+            .map(|dim| dim.try_into().map_err(Error::Index))
+            .collect::<Result<_, _>>()?;
+
+        let block_map = ArrayBase::new(
+            block_map_shape,
+            (0..num_blocks as u64).into_iter().collect(),
+        )?;
+
+        let mut block_map_bounds = Vec::with_capacity(block_axis + 1);
+        for bound in bounds.0.iter().take(block_axis) {
+            let bound = bound.clone().try_into()?;
+            block_map_bounds.push(bound);
+        }
+
+        if bounds.0.len() > block_axis {
+            let bound = match &bounds.0[block_axis] {
+                AxisBound::At(i) => {
+                    let stride = block_map.shape().last().expect("stride");
+                    let i = usize::try_from(*i).map_err(Error::Index)? / stride;
+                    ha_ndarray::AxisBound::At(i)
+                }
+                AxisBound::In(start, stop, _step) => {
+                    let stride = block_shape[0];
+                    let start = usize::try_from(*start).map_err(Error::Index)? / stride;
+                    let stop = usize::try_from(*stop).map_err(Error::Index)? / stride;
+                    ha_ndarray::AxisBound::In(start, stop, 1)
+                }
+                AxisBound::Of(indices) => {
+                    let stride = block_map.shape().last().expect("stride");
+                    let indices = indices
+                        .iter()
+                        .copied()
+                        .map(|i| usize::try_from(i).map(|i| i / stride).map_err(Error::Index))
+                        .collect::<Result<Vec<usize>, Error>>()?;
+
+                    ha_ndarray::AxisBound::Of(indices)
+                }
+            };
+
+            block_map_bounds.push(bound);
+        }
+
+        let block_map = block_map.slice(block_map_bounds)?;
+        let block_map = ArrayBase::copy(&block_map)?;
+
+        let mut shape = Shape::with_capacity(source.ndim());
+        for (bound, dim) in bounds.0.iter().zip(source.shape()) {
+            match bound {
+                AxisBound::At(i) => {
+                    if i > dim {
+                        return Err(Error::Bounds(format!(
+                            "index {} is out of bounds for dimension {}",
+                            i, dim
+                        )));
+                    }
+                }
+                AxisBound::In(start, stop, step) => {
+                    if start < stop {
+                        shape.push((stop - start) / step);
+                    }
+                }
+                AxisBound::Of(indices) => {
+                    if indices.iter().all(|i| i < dim) {
+                        shape.push(indices.len() as u64);
+                    } else {
+                        return Err(Error::Bounds(format!(
+                            "indices {:?} are out of bounds for dimension {}",
+                            indices, dim
+                        )));
+                    }
+                }
+            }
+        }
+
+        let block_size = shape.iter().product::<u64>() as usize / num_blocks;
+
+        Ok(Self {
+            source,
+            bounds,
+            shape,
+            block_map,
+            block_size,
+        })
+    }
+}
+
+impl<S: TensorInstance> TensorInstance for DenseSlice<S> {
+    fn dtype(&self) -> NumberType {
+        self.source.dtype()
+    }
+
+    fn shape(&self) -> &[u64] {
+        &self.shape
+    }
+}
+
+#[async_trait]
+impl<S: DenseInstance + Clone> DenseInstance for DenseSlice<S>
+where
+    <S::Block as NDArrayTransform>::Slice: NDArrayRead<DType = S::DType> + NDArrayTransform,
+{
+    type Block = <S::Block as NDArrayTransform>::Slice;
+    type DType = S::DType;
+
+    fn block_size(&self) -> usize {
+        self.block_size
+    }
+
+    async fn read_block(&self, block_id: u64) -> Result<Self::Block, Error> {
+        let source_block_id = source_block_id_for(&self.block_map, block_id)?;
+
+        let block_axis = block_axis_for(&self.shape, self.block_size);
+        let block_shape = block_shape_for(block_axis, &self.shape, self.block_size);
+
+        let local_bound = match ha_ndarray::AxisBound::try_from(self.bounds.0[block_axis].clone())?
+        {
+            ha_ndarray::AxisBound::At(i) => ha_ndarray::AxisBound::At(i),
+            ha_ndarray::AxisBound::In(start, stop, step) => {
+                let stride = block_shape[0];
+
+                if source_block_id == 0 {
+                    ha_ndarray::AxisBound::In(start, stride, step)
+                } else if source_block_id == self.block_map.size() as u64 - 1 {
+                    ha_ndarray::AxisBound::In(stop - (stop % stride), stop, step)
+                } else {
+                    let start = source_block_id as usize * stride;
+                    ha_ndarray::AxisBound::In(start, start + stride, step)
+                }
+            }
+            ha_ndarray::AxisBound::Of(indices) => {
+                if source_block_id < indices.len() as u64 {
+                    let i = indices[source_block_id as usize] as usize;
+                    ha_ndarray::AxisBound::At(i)
+                } else {
+                    return Err(Error::Bounds(format!(
+                        "block id {} is out of range",
+                        block_id
+                    )));
+                }
+            }
+        };
+
+        let mut block_bounds = Vec::with_capacity(self.ndim());
+        for bound in self.bounds.0.iter().take(block_axis).cloned() {
+            block_bounds.push(bound.try_into()?);
+        }
+
+        if block_bounds.is_empty() {
+            block_bounds.push(local_bound);
+        } else {
+            block_bounds[0] = local_bound;
+        }
+
+        let source_block = self.source.read_block(source_block_id).await?;
+        source_block.slice(block_bounds).map_err(Error::from)
+    }
+
+    async fn into_blocks(self) -> Result<BlockStream<Self::Block>, Error> {
+        let block_map = self.block_map;
+        let bounds = self.bounds;
+        let ndim = self.shape.len();
+        let source = self.source;
+
+        let block_axis = block_axis_for(&self.shape, self.block_size);
+        let block_shape = block_shape_for(block_axis, &self.shape, self.block_size);
+
+        let local_bounds = match ha_ndarray::AxisBound::try_from(bounds.0[block_axis].clone())? {
+            ha_ndarray::AxisBound::At(i) => {
+                debug_assert_eq!(block_map.size(), 1);
+                vec![ha_ndarray::AxisBound::At(i)]
+            }
+            ha_ndarray::AxisBound::In(start, stop, step) => {
+                let stride = block_shape[0];
+
+                if block_map.size() == 1 {
+                    vec![ha_ndarray::AxisBound::In(start, stop, step)]
+                } else {
+                    let mut local_bounds = Vec::with_capacity(block_map.size());
+                    local_bounds.push(ha_ndarray::AxisBound::In(start, stride, step));
+
+                    for i in 0..(block_map.size() - 2) {
+                        let start = stride * i;
+                        local_bounds.push(ha_ndarray::AxisBound::In(start, start + stride, step));
+                    }
+
+                    local_bounds.push(ha_ndarray::AxisBound::In(
+                        stop - (stop % stride),
+                        stop,
+                        step,
+                    ));
+
+                    local_bounds
+                }
+            }
+            ha_ndarray::AxisBound::Of(indices) => {
+                indices.into_iter().map(ha_ndarray::AxisBound::At).collect()
+            }
+        };
+
+        let mut block_bounds = Vec::<ha_ndarray::AxisBound>::with_capacity(ndim);
+        for bound in bounds.0.iter().skip(block_axis).cloned() {
+            block_bounds.push(bound.try_into()?);
+        }
+
+        debug_assert_eq!(block_map.size(), local_bounds.len());
+        let blocks = stream::iter(block_map.into_data().into_iter().zip(local_bounds))
+            .map(move |(block_id, local_bound)| {
+                let mut block_bounds = block_bounds.to_vec();
+                let source = source.clone();
+
+                async move {
+                    let block = source.read_block(block_id).await?;
+
+                    if block_bounds.is_empty() {
+                        block_bounds.push(local_bound);
+                    } else {
+                        block_bounds[0] = local_bound;
+                    }
+
+                    block.slice(block_bounds).map_err(Error::from)
+                }
+            })
+            .buffered(num_cpus::get());
+
+        Ok(Box::pin(blocks))
+    }
+}
+
+impl<S: fmt::Debug> fmt::Debug for DenseSlice<S> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "slice {:?} from {:?}", self.bounds, self.source)
+    }
+}
+
+#[derive(Clone)]
 pub struct DenseTranspose<S> {
     source: S,
     shape: Shape,
@@ -431,7 +686,7 @@ impl<S: TensorInstance> TensorInstance for DenseTranspose<S> {
     }
 
     fn shape(&self) -> &[u64] {
-        self.source.shape()
+        &self.shape
     }
 }
 
@@ -448,26 +703,14 @@ where
     }
 
     async fn read_block(&self, block_id: u64) -> Result<Self::Block, Error> {
-        let source_block_id = self
-            .block_map
-            .as_slice()
-            .get(block_id as usize)
-            .copied()
-            .ok_or_else(|| {
-                Error::Bounds(format!(
-                    "block {} is out of bounds for {:?}",
-                    block_id, self
-                ))
-            })?;
-
+        let source_block_id = source_block_id_for(&self.block_map, block_id)?;
         let block = self.source.read_block(source_block_id).await?;
-
         block
             .transpose(Some(self.permutation.to_vec()))
             .map_err(Error::from)
     }
 
-    async fn blocks(self) -> Result<BlockStream<Self::Block>, Error> {
+    async fn into_blocks(self) -> Result<BlockStream<Self::Block>, Error> {
         let permutation = self.permutation;
 
         let blocks = stream::iter(self.block_map.into_data())
@@ -531,6 +774,8 @@ fn block_shape_for(axis: usize, shape: &[u64], block_size: usize) -> BlockShape 
         block_shape.push(axis_dim);
         block_shape.extend(shape.iter().skip(axis).copied().map(|dim| dim as usize));
 
+        debug_assert!(!block_shape.is_empty());
+
         block_shape
     }
 }
@@ -542,6 +787,15 @@ fn div_ceil(num: u64, denom: u64) -> u64 {
     } else {
         (num / denom) + 1
     }
+}
+
+#[inline]
+fn source_block_id_for(block_map: &ArrayBase<u64>, block_id: u64) -> Result<u64, Error> {
+    block_map
+        .as_slice()
+        .get(block_id as usize)
+        .copied()
+        .ok_or_else(|| Error::Bounds(format!("block id {} is out of range", block_id)))
 }
 
 #[inline]

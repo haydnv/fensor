@@ -23,6 +23,35 @@ pub enum AxisBound {
     Of(Vec<u64>),
 }
 
+impl TryFrom<AxisBound> for ha_ndarray::AxisBound {
+    type Error = Error;
+
+    fn try_from(bound: AxisBound) -> Result<Self, Self::Error> {
+        match bound {
+            AxisBound::At(i) => i
+                .try_into()
+                .map(ha_ndarray::AxisBound::At)
+                .map_err(Error::Index),
+
+            AxisBound::In(start, stop, step) => {
+                let start = start.try_into().map_err(Error::Index)?;
+                let stop = stop.try_into().map_err(Error::Index)?;
+                let step = step.try_into().map_err(Error::Index)?;
+                Ok(ha_ndarray::AxisBound::In(start, stop, step))
+            }
+
+            AxisBound::Of(indices) => {
+                let indices = indices
+                    .into_iter()
+                    .map(|i| i.try_into().map_err(Error::Index))
+                    .collect::<Result<Vec<usize>, Error>>()?;
+
+                Ok(ha_ndarray::AxisBound::Of(indices))
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Bounds(Vec<AxisBound>);
 
@@ -37,6 +66,7 @@ pub enum Error {
     Bounds(String),
     IO(std::io::Error),
     Math(ha_ndarray::Error),
+    Index(<u64 as TryInto<usize>>::Error),
 }
 
 impl fmt::Display for Error {
@@ -45,6 +75,7 @@ impl fmt::Display for Error {
             Self::Bounds(cause) => cause.fmt(f),
             Self::IO(cause) => cause.fmt(f),
             Self::Math(cause) => cause.fmt(f),
+            Self::Index(cause) => cause.fmt(f),
         }
     }
 }
