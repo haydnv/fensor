@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::ops::Bound;
@@ -267,6 +266,7 @@ impl<FE, T> fmt::Debug for SparseTable<FE, T> {
     }
 }
 
+// TODO: multi-axis sparse broadcast
 #[derive(Clone)]
 pub struct SparseBroadcastAxis<S> {
     source: S,
@@ -777,63 +777,12 @@ where
     type Blocks = Pin<Box<dyn Stream<Item = Result<(Self::CoordBlock, Self::ValueBlock), Error>>>>;
     type DType = S::DType;
 
-    async fn blocks(self, mut bounds: Bounds) -> Result<Self::Blocks, Error> {
-        let bounds = match bounds.0.len().cmp(&self.ndim()) {
-            Ordering::Equal => Ok(bounds),
-            Ordering::Greater => Err(Error::Bounds(format!(
-                "invalid bounds for {:?}: {:?}",
-                self, bounds
-            ))),
-            Ordering::Less => {
-                let dims = self.shape.iter().skip(bounds.0.len()).copied();
-                bounds.0.extend(dims.map(|dim| AxisBound::In(0, dim, 1)));
-                Ok(bounds)
-            }
-        }?;
-
-        let permutation = self.permutation;
-
-        let source_bounds = permutation
-            .iter()
-            .copied()
-            .map(|x| bounds.0[x].clone())
-            .collect();
-
-        let source_blocks = self.source.blocks(source_bounds).await?;
-        let blocks = source_blocks.map(move |result| {
-            let (source_coords, values) = result?;
-            let coords = source_coords.transpose(Some(permutation.to_vec()))?;
-            let coords = ArrayBase::copy(&coords)?;
-            Result::<_, Error>::Ok((coords, values))
-        });
-
-        Ok(Box::pin(blocks))
+    async fn blocks(self, _bounds: Bounds) -> Result<Self::Blocks, Error> {
+        todo!("support an order parameter in SparseInstance::blocks")
     }
 
-    async fn elements(self, bounds: Bounds) -> Result<Elements<Self::DType>, Error> {
-        let ndim = self.ndim();
-        let size_hint = size_hint(self.size());
-        let blocks = self.blocks(bounds).await?;
-
-        let context = ha_ndarray::Context::default()?;
-        let queue = ha_ndarray::Queue::new(context, size_hint)?;
-
-        let elements = blocks
-            .map(move |result| {
-                let (coords, values) = result?;
-                let coords = coords.into_data();
-                let values = values.to_vec(&queue)?;
-                let elements = coords
-                    .into_par_iter()
-                    .chunks(ndim)
-                    .zip(values)
-                    .collect::<Vec<(Coord, Self::DType)>>();
-
-                Result::<_, Error>::Ok(futures::stream::iter(elements).map(Ok))
-            })
-            .try_flatten();
-
-        Ok(Box::pin(elements))
+    async fn elements(self, _bounds: Bounds) -> Result<Elements<Self::DType>, Error> {
+        todo!("support an order parameter in SparseInstance::elements")
     }
 }
 

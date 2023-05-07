@@ -108,6 +108,16 @@ pub trait TensorInstance: Send + Sync + 'static {
     }
 }
 
+impl<T: TensorInstance> TensorInstance for Box<T> {
+    fn dtype(&self) -> NumberType {
+        (**self).dtype()
+    }
+
+    fn shape(&self) -> &[u64] {
+        (**self).shape()
+    }
+}
+
 pub trait TensorTransform: TensorInstance {
     type Broadcast: TensorInstance;
     type Expand: TensorInstance;

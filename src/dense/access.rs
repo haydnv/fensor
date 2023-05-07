@@ -5,7 +5,7 @@ use std::{fmt, io};
 use async_trait::async_trait;
 use destream::de;
 use freqfs::{DirLock, FileLoad};
-use futures::{stream, Stream, StreamExt, TryStreamExt};
+use futures::{stream, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use ha_ndarray::*;
 use number_general::{DType, NumberClass, NumberInstance, NumberType};
 use safecast::AsType;
@@ -14,106 +14,14 @@ use crate::{
     validate_shape, Axes, AxisBound, Bounds, Error, Shape, TensorInstance, IDEAL_BLOCK_SIZE,
 };
 
+use super::cache::Cached;
+
 type BlockShape = ha_ndarray::Shape;
 type BlockStream<Block> = Pin<Box<dyn Stream<Item = Result<Block, Error>>>>;
 
-pub struct Array<T> {
-    data: Vec<T>,
-}
-
-impl<T> From<Vec<T>> for Array<T> {
-    fn from(data: Vec<T>) -> Self {
-        Self { data }
-    }
-}
-
-struct ArrayVisitor<T> {
-    data: Vec<T>,
-}
-
-impl<T> ArrayVisitor<T> {
-    fn new() -> Self {
-        Self {
-            data: Vec::with_capacity(IDEAL_BLOCK_SIZE * 2),
-        }
-    }
-}
-
-macro_rules! decode_array {
-    ($t:ty, $name:expr, $decode:ident, $visit:ident) => {
-        #[async_trait]
-        impl de::Visitor for ArrayVisitor<$t> {
-            type Value = Array<$t>;
-
-            fn expecting() -> &'static str {
-                $name
-            }
-
-            async fn $visit<A: de::ArrayAccess<$t>>(
-                self,
-                mut array: A,
-            ) -> Result<Self::Value, A::Error> {
-                const BUF_SIZE: usize = 4_096;
-                let mut data = self.data;
-
-                let mut buf = [<$t>::zero(); BUF_SIZE];
-                loop {
-                    let len = array.buffer(&mut buf).await?;
-                    if len == 0 {
-                        break;
-                    } else {
-                        data.extend_from_slice(&buf[..len]);
-                    }
-                }
-
-                Ok(Array { data })
-            }
-        }
-
-        #[async_trait]
-        impl de::FromStream for Array<$t> {
-            type Context = ();
-
-            async fn from_stream<D: de::Decoder>(
-                _cxt: (),
-                decoder: &mut D,
-            ) -> Result<Self, D::Error> {
-                decoder.$decode(ArrayVisitor::<$t>::new()).await
-            }
-        }
-    };
-}
-
-decode_array!(u8, "byte array", decode_array_u8, visit_array_u8);
-decode_array!(
-    u16,
-    "16-bit unsigned int array",
-    decode_array_u16,
-    visit_array_u16
-);
-decode_array!(
-    u32,
-    "32-bit unsigned int array",
-    decode_array_u32,
-    visit_array_u32
-);
-decode_array!(
-    u64,
-    "64-bit unsigned int array",
-    decode_array_u64,
-    visit_array_u64
-);
-
-decode_array!(i16, "16-bit int array", decode_array_i16, visit_array_i16);
-decode_array!(i32, "32-bit int array", decode_array_i32, visit_array_i32);
-decode_array!(i64, "64-bit int array", decode_array_i64, visit_array_i64);
-
-decode_array!(f32, "32-bit int array", decode_array_f32, visit_array_f32);
-decode_array!(f64, "64-bit int array", decode_array_f64, visit_array_f64);
-
 #[async_trait]
 pub trait DenseInstance: TensorInstance + fmt::Debug + Send + Sync + 'static {
-    type Block: NDArrayRead<DType = Self::DType> + NDArrayTransform;
+    type Block: NDArrayRead<DType = Self::DType> + NDArrayTransform + Into<Array<Self::DType>>;
     type DType: CDatatype + DType;
 
     fn block_size(&self) -> usize;
@@ -121,6 +29,101 @@ pub trait DenseInstance: TensorInstance + fmt::Debug + Send + Sync + 'static {
     async fn read_block(&self, block_id: u64) -> Result<Self::Block, Error>;
 
     async fn into_blocks(self) -> Result<BlockStream<Self::Block>, Error>;
+}
+
+#[async_trait]
+impl<T: DenseInstance> DenseInstance for Box<T> {
+    type Block = T::Block;
+    type DType = T::DType;
+
+    fn block_size(&self) -> usize {
+        (&**self).block_size()
+    }
+
+    async fn read_block(&self, block_id: u64) -> Result<Self::Block, Error> {
+        (**self).read_block(block_id).await
+    }
+
+    async fn into_blocks(self) -> Result<BlockStream<Self::Block>, Error> {
+        (*self).into_blocks().await
+    }
+}
+
+#[derive(Clone)]
+pub enum DenseAccess<FE, T> {
+    File(DenseFile<FE, T>),
+    Broadcast(Box<DenseBroadcast<Self>>),
+    Reshape(Box<DenseReshape<Self>>),
+    Slice(Box<DenseSlice<Self>>),
+}
+
+macro_rules! array_dispatch {
+    ($this:ident, $var:ident, $call:expr) => {
+        match $this {
+            Self::File($var) => $call,
+            Self::Broadcast($var) => $call,
+            Self::Reshape($var) => $call,
+            Self::Slice($var) => $call,
+        }
+    };
+}
+
+impl<FE, T> TensorInstance for DenseAccess<FE, T>
+where
+    FE: Send + Sync + 'static,
+    T: DType + Send + Sync + 'static,
+{
+    fn dtype(&self) -> NumberType {
+        T::dtype()
+    }
+
+    fn shape(&self) -> &[u64] {
+        array_dispatch!(self, this, this.shape())
+    }
+}
+
+#[async_trait]
+impl<FE, T> DenseInstance for DenseAccess<FE, T>
+where
+    FE: FileLoad + AsType<Cached<T>> + Send + Sync,
+    T: CDatatype + DType + NumberInstance,
+    Cached<T>: de::FromStream<Context = ()>,
+    Box<Self>: DenseInstance,
+    Self: Clone,
+{
+    type Block = Array<T>;
+    type DType = T;
+
+    fn block_size(&self) -> usize {
+        array_dispatch!(self, this, this.block_size())
+    }
+
+    async fn read_block(&self, block_id: u64) -> Result<Self::Block, Error> {
+        array_dispatch!(
+            self,
+            this,
+            this.read_block(block_id).map_ok(Array::from).await
+        )
+    }
+
+    async fn into_blocks(self) -> Result<BlockStream<Self::Block>, Error> {
+        match self {
+            Self::File(file) => Ok(Box::pin(file.into_blocks().await?.map_ok(Array::from))),
+            Self::Broadcast(broadcast) => {
+                Ok(Box::pin(broadcast.into_blocks().await?.map_ok(Array::from)))
+            }
+            Self::Reshape(reshape) => {
+                Ok(Box::pin(reshape.into_blocks().await?.map_ok(Array::from)))
+            }
+            Self::Slice(slice) => Ok(Box::pin(slice.into_blocks().await?.map_ok(Array::from))),
+        }
+    }
+}
+
+impl<FE, T> fmt::Debug for DenseAccess<FE, T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        array_dispatch!(self, this, this.fmt(f))
+    }
 }
 
 #[derive(Clone)]
@@ -134,7 +137,7 @@ pub struct DenseFile<FE, T> {
 
 impl<FE, T> DenseFile<FE, T>
 where
-    FE: FileLoad + AsType<Array<T>> + Send + Sync,
+    FE: FileLoad + AsType<Cached<T>> + Send + Sync,
     T: CDatatype + DType + NumberInstance,
 {
     pub async fn constant(dir: DirLock<FE>, shape: Shape, value: T) -> Result<Self, Error> {
@@ -228,9 +231,9 @@ where
 #[async_trait]
 impl<FE, T> DenseInstance for DenseFile<FE, T>
 where
-    FE: FileLoad + AsType<Array<T>>,
+    FE: FileLoad + AsType<Cached<T>>,
     T: CDatatype + DType + 'static,
-    Array<T>: de::FromStream<Context = ()>,
+    Cached<T>: de::FromStream<Context = ()>,
 {
     type Block = ArrayBase<T>;
     type DType = T;
@@ -308,7 +311,9 @@ impl<S: TensorInstance> TensorInstance for DenseBroadcast<S> {
 #[async_trait]
 impl<S: DenseInstance + Clone> DenseInstance for DenseBroadcast<S>
 where
-    <S::Block as NDArrayTransform>::Broadcast: NDArrayRead<DType = S::DType> + NDArrayTransform,
+    S::Block: NDArrayTransform,
+    <S::Block as NDArrayTransform>::Broadcast:
+        NDArrayRead<DType = S::DType> + NDArrayTransform + Into<Array<S::DType>>,
 {
     type Block = <S::Block as NDArrayTransform>::Broadcast;
     type DType = S::DType;
@@ -371,7 +376,9 @@ impl<S: TensorInstance> TensorInstance for DenseReshape<S> {
 #[async_trait]
 impl<S: DenseInstance> DenseInstance for DenseReshape<S>
 where
-    <S::Block as NDArrayTransform>::Reshape: NDArrayRead<DType = S::DType> + NDArrayTransform,
+    S::Block: NDArrayTransform,
+    <S::Block as NDArrayTransform>::Reshape:
+        NDArrayRead<DType = S::DType> + NDArrayTransform + Into<Array<S::DType>>,
 {
     type Block = <S::Block as NDArrayTransform>::Reshape;
     type DType = S::DType;
@@ -553,7 +560,9 @@ impl<S: TensorInstance> TensorInstance for DenseSlice<S> {
 #[async_trait]
 impl<S: DenseInstance + Clone> DenseInstance for DenseSlice<S>
 where
-    <S::Block as NDArrayTransform>::Slice: NDArrayRead<DType = S::DType> + NDArrayTransform,
+    S::Block: NDArrayTransform,
+    <S::Block as NDArrayTransform>::Slice:
+        NDArrayRead<DType = S::DType> + NDArrayTransform + Into<Array<S::DType>>,
 {
     type Block = <S::Block as NDArrayTransform>::Slice;
     type DType = S::DType;
@@ -767,7 +776,9 @@ impl<S: TensorInstance> TensorInstance for DenseTranspose<S> {
 #[async_trait]
 impl<S: DenseInstance + Clone> DenseInstance for DenseTranspose<S>
 where
-    <S::Block as NDArrayTransform>::Transpose: NDArrayRead<DType = S::DType> + NDArrayTransform,
+    S::Block: NDArrayTransform,
+    <S::Block as NDArrayTransform>::Transpose:
+        NDArrayRead<DType = S::DType> + NDArrayTransform + Into<Array<S::DType>>,
 {
     type Block = <S::Block as NDArrayTransform>::Transpose;
     type DType = S::DType;
