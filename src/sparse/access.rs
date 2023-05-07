@@ -1,8 +1,8 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::marker::PhantomData;
 use std::ops::Bound;
 use std::pin::Pin;
-use std::{fmt, io};
 
 use async_trait::async_trait;
 use b_table::{Range, TableLock};
@@ -14,157 +14,10 @@ use number_general::{DType, Number, NumberCollator, NumberType};
 use rayon::prelude::*;
 use safecast::{AsType, CastInto};
 
-use super::stream;
-
 use crate::{strides_for, Axes, AxisBound, Bounds, Coord, Error, Shape, Strides, TensorInstance};
 
-const BLOCK_SIZE: usize = 4_096;
-
-pub type Elements<T> = Pin<Box<dyn Stream<Item = Result<(Coord, T), Error>>>>;
-pub type Node = b_table::b_tree::Node<Vec<Vec<Number>>>;
-
-#[derive(Clone, Eq, PartialEq)]
-pub struct IndexSchema {
-    columns: Axes,
-}
-
-impl IndexSchema {
-    pub fn new(columns: Axes) -> Self {
-        Self { columns }
-    }
-}
-
-impl b_table::b_tree::Schema for IndexSchema {
-    type Error = Error;
-    type Value = Number;
-
-    fn block_size(&self) -> usize {
-        BLOCK_SIZE
-    }
-
-    fn len(&self) -> usize {
-        self.columns.len()
-    }
-
-    fn order(&self) -> usize {
-        12
-    }
-
-    fn validate(&self, key: Vec<Self::Value>) -> Result<Vec<Self::Value>, Self::Error> {
-        if key.len() == self.len() {
-            Ok(key)
-        } else {
-            Err(io::Error::new(io::ErrorKind::InvalidData, "wrong number of values").into())
-        }
-    }
-}
-
-impl b_table::IndexSchema for IndexSchema {
-    type Id = usize;
-
-    fn columns(&self) -> &[Self::Id] {
-        &self.columns
-    }
-
-    fn extract_key(&self, key: &[Self::Value], other: &Self) -> Vec<Self::Value> {
-        debug_assert_eq!(key.len(), self.columns.len());
-        other.columns.iter().copied().map(|x| key[x]).collect()
-    }
-}
-
-impl fmt::Debug for IndexSchema {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str("sparse tensor index schema")
-    }
-}
-
-#[derive(Clone, Eq, PartialEq)]
-pub struct Schema {
-    primary: IndexSchema,
-    auxiliary: Vec<(String, IndexSchema)>,
-    shape: Shape,
-}
-
-impl Schema {
-    pub fn new(shape: Shape) -> Self {
-        let primary = IndexSchema::new((0..shape.len() + 1).into_iter().collect());
-        let mut auxiliary = Vec::with_capacity(shape.len());
-        for x in 0..shape.len() {
-            let mut columns = Vec::with_capacity(shape.len());
-            columns.push(x);
-
-            for xo in 0..shape.len() {
-                if xo != x {
-                    columns.push(xo);
-                }
-            }
-
-            let index_schema = IndexSchema::new(columns);
-            auxiliary.push((x.to_string(), index_schema));
-        }
-
-        Self {
-            primary,
-            auxiliary,
-            shape,
-        }
-    }
-}
-
-impl b_table::Schema for Schema {
-    type Id = usize;
-    type Error = Error;
-    type Value = Number;
-    type Index = IndexSchema;
-
-    fn key(&self) -> &[Self::Id] {
-        &self.primary.columns[..self.shape.len()]
-    }
-
-    fn values(&self) -> &[Self::Id] {
-        &self.primary.columns[self.shape.len()..]
-    }
-
-    fn primary(&self) -> &Self::Index {
-        &self.primary
-    }
-
-    fn auxiliary(&self) -> &[(String, IndexSchema)] {
-        &self.auxiliary
-    }
-
-    fn validate_key(&self, key: Vec<Self::Value>) -> Result<Vec<Self::Value>, Self::Error> {
-        if key.len() == self.shape.len() {
-            Ok(key)
-        } else {
-            let cause = io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid key: {:?}", key),
-            );
-
-            Err(cause.into())
-        }
-    }
-
-    fn validate_values(&self, values: Vec<Self::Value>) -> Result<Vec<Self::Value>, Self::Error> {
-        if values.len() == 1 {
-            Ok(values)
-        } else {
-            let cause = io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid values: {:?}", values),
-            );
-
-            Err(cause.into())
-        }
-    }
-}
-
-impl fmt::Debug for Schema {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str("sparse tensor schema")
-    }
-}
+use super::stream;
+use super::{Elements, IndexSchema, Node, Schema};
 
 #[async_trait]
 pub trait SparseInstance: TensorInstance + fmt::Debug {
@@ -190,6 +43,100 @@ pub trait SparseInstance: TensorInstance + fmt::Debug {
         self.elements(bounds)
             .map_ok(|elements| stream::FilledAt::new(elements, axes, ndim))
             .await
+    }
+}
+
+#[derive(Clone)]
+pub enum SparseAccess<FE, T> {
+    Table(SparseTable<FE, T>),
+    Broadcast(Box<SparseBroadcast<Self>>),
+    Expand(Box<SparseExpand<Self>>),
+    Reshape(Box<SparseReshape<Self>>),
+    Slice(Box<SparseSlice<Self>>),
+}
+
+macro_rules! array_dispatch {
+    ($this:ident, $var:ident, $call:expr) => {
+        match $this {
+            Self::Table($var) => $call,
+            Self::Broadcast($var) => $call,
+            Self::Expand($var) => $call,
+            Self::Reshape($var) => $call,
+            Self::Slice($var) => $call,
+        }
+    };
+}
+
+impl<FE: Send + Sync + 'static, T: CDatatype + DType> TensorInstance for SparseAccess<FE, T> {
+    fn dtype(&self) -> NumberType {
+        array_dispatch!(self, this, this.dtype())
+    }
+
+    fn shape(&self) -> &[u64] {
+        array_dispatch!(self, this, this.shape())
+    }
+}
+
+#[async_trait]
+impl<FE, T> SparseInstance for SparseAccess<FE, T>
+where
+    FE: AsType<Node> + Send + Sync + 'static,
+    T: CDatatype + DType,
+    Number: CastInto<T>,
+{
+    type CoordBlock = Array<u64>;
+    type ValueBlock = Array<T>;
+    type Blocks = Pin<Box<dyn Stream<Item = Result<(Array<u64>, Array<T>), Error>>>>;
+    type DType = T;
+
+    async fn blocks(self, bounds: Bounds) -> Result<Self::Blocks, Error> {
+        match self {
+            Self::Table(table) => {
+                let blocks = table.blocks(bounds).await?;
+                let blocks =
+                    blocks.map_ok(|(coords, values)| (Array::from(coords), Array::from(values)));
+
+                Ok(Box::pin(blocks))
+            }
+            Self::Broadcast(broadcast) => {
+                let blocks = broadcast.blocks(bounds).await?;
+                let blocks =
+                    blocks.map_ok(|(coords, values)| (Array::from(coords), Array::from(values)));
+
+                Ok(Box::pin(blocks))
+            }
+            Self::Expand(expand) => {
+                let blocks = expand.blocks(bounds).await?;
+                let blocks =
+                    blocks.map_ok(|(coords, values)| (Array::from(coords), Array::from(values)));
+
+                Ok(Box::pin(blocks))
+            }
+            Self::Reshape(reshape) => {
+                let blocks = reshape.blocks(bounds).await?;
+                let blocks =
+                    blocks.map_ok(|(coords, values)| (Array::from(coords), Array::from(values)));
+
+                Ok(Box::pin(blocks))
+            }
+            Self::Slice(slice) => {
+                let blocks = slice.blocks(bounds).await?;
+                let blocks =
+                    blocks.map_ok(|(coords, values)| (Array::from(coords), Array::from(values)));
+
+                Ok(Box::pin(blocks))
+            }
+        }
+    }
+
+    async fn elements(self, bounds: Bounds) -> Result<Elements<Self::DType>, Error> {
+        array_dispatch!(self, this, this.elements(bounds).await)
+    }
+}
+
+impl<FE, T> fmt::Debug for SparseAccess<FE, T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        array_dispatch!(self, this, this.fmt(f))
     }
 }
 
@@ -266,16 +213,15 @@ impl<FE, T> fmt::Debug for SparseTable<FE, T> {
     }
 }
 
-// TODO: multi-axis sparse broadcast
 #[derive(Clone)]
-pub struct SparseBroadcastAxis<S> {
+pub struct SparseBroadcast<S> {
     source: S,
     axis: usize,
     dim: u64,
     shape: Shape,
 }
 
-impl<S: TensorInstance + fmt::Debug> SparseBroadcastAxis<S> {
+impl<S: TensorInstance + fmt::Debug> SparseBroadcast<S> {
     fn new(source: S, axis: usize, dim: u64) -> Result<Self, Error> {
         let shape = if axis < source.ndim() {
             let mut shape = source.shape().to_vec();
@@ -304,7 +250,7 @@ impl<S: TensorInstance + fmt::Debug> SparseBroadcastAxis<S> {
     }
 }
 
-impl<S: TensorInstance> TensorInstance for SparseBroadcastAxis<S> {
+impl<S: TensorInstance> TensorInstance for SparseBroadcast<S> {
     fn dtype(&self) -> NumberType {
         self.source.dtype()
     }
@@ -315,7 +261,7 @@ impl<S: TensorInstance> TensorInstance for SparseBroadcastAxis<S> {
 }
 
 #[async_trait]
-impl<S: SparseInstance> SparseInstance for SparseBroadcastAxis<S> {
+impl<S: SparseInstance> SparseInstance for SparseBroadcast<S> {
     type CoordBlock = ArrayBase<u64>;
     type ValueBlock = ArrayBase<Self::DType>;
     type Blocks = stream::BlockCoords<Elements<Self::DType>, Self::DType>;
@@ -370,7 +316,7 @@ impl<S: SparseInstance> SparseInstance for SparseBroadcastAxis<S> {
     }
 }
 
-impl<S: fmt::Debug> fmt::Debug for SparseBroadcastAxis<S> {
+impl<S: fmt::Debug> fmt::Debug for SparseBroadcast<S> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "broadcast of {:?} axis {}", self.source, self.axis)
     }
