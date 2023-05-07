@@ -10,7 +10,7 @@ use ha_ndarray::*;
 use number_general::{DType, NumberClass, NumberInstance, NumberType};
 use safecast::AsType;
 
-use super::{
+use crate::{
     validate_shape, Axes, AxisBound, Bounds, Error, Shape, TensorInstance, IDEAL_BLOCK_SIZE,
 };
 
