@@ -1,6 +1,10 @@
 use std::fmt;
 
-use number_general::NumberType;
+use ha_ndarray::CDatatype;
+use number_general::{DType, NumberType};
+
+pub use dense::{DenseFile, DenseTensor};
+pub use sparse::{SparseTable, SparseTensor};
 
 pub mod dense;
 pub mod sparse;
@@ -134,6 +138,28 @@ pub trait TensorTransform: TensorInstance {
     fn slice(self, bounds: Bounds) -> Result<Self::Slice, Error>;
 
     fn transpose(self, axes: Axes) -> Result<Self::Transpose, Error>;
+}
+
+pub enum Tensor<FE, T> {
+    Dense(DenseTensor<FE, T>),
+    Sparse(SparseTensor<FE, T>),
+}
+
+impl<FE, T> TensorInstance for Tensor<FE, T>
+where
+    FE: Send + Sync + 'static,
+    T: CDatatype + DType,
+{
+    fn dtype(&self) -> NumberType {
+        T::dtype()
+    }
+
+    fn shape(&self) -> &[u64] {
+        match self {
+            Self::Dense(dense) => dense.shape(),
+            Self::Sparse(sparse) => sparse.shape(),
+        }
+    }
 }
 
 #[inline]

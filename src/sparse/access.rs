@@ -17,8 +17,9 @@ use safecast::{AsType, CastInto};
 
 use crate::{strides_for, Axes, AxisBound, Bounds, Coord, Error, Shape, Strides, TensorInstance};
 
+use super::schema::{IndexSchema, Schema};
 use super::stream;
-use super::{Elements, IndexSchema, Node, Schema};
+use super::{Elements, Node};
 
 #[async_trait]
 pub trait SparseInstance: TensorInstance + fmt::Debug {
@@ -178,7 +179,7 @@ where
     }
 
     fn shape(&self) -> &[u64] {
-        &self.table.schema().shape
+        self.table.schema().shape()
     }
 }
 
@@ -210,7 +211,11 @@ where
 
 impl<FE, T> fmt::Debug for SparseTable<FE, T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "sparse table with shape {:?}", self.table.schema().shape)
+        write!(
+            f,
+            "sparse table with shape {:?}",
+            self.table.schema().shape()
+        )
     }
 }
 
