@@ -1,8 +1,10 @@
-use ha_ndarray::CDatatype;
+use ha_ndarray::{Buffer, CDatatype};
 use number_general::{DType, NumberType};
+use safecast::AsType;
 
-use super::TensorInstance;
+use super::{TensorInstance, TensorTransform};
 
+use crate::{Axes, Bounds, Error, Shape};
 pub use access::{DenseAccess, DenseFile, DenseInstance, DenseSlice};
 
 mod access;
@@ -24,5 +26,31 @@ impl<FE: Send + Sync + 'static, T: CDatatype + DType> TensorInstance for DenseTe
             Self::Slice(slice) => slice.shape(),
             Self::View(view) => view.shape(),
         }
+    }
+}
+
+impl<FE, T> TensorTransform for DenseTensor<FE, T>
+where
+    FE: AsType<Buffer<T>> + Send + Sync + 'static,
+    T: CDatatype + DType,
+{
+    fn broadcast(self, shape: Shape) -> Result<Self, Error> {
+        todo!()
+    }
+
+    fn expand(self, axes: Axes) -> Result<Self, Error> {
+        todo!()
+    }
+
+    fn reshape(self, shape: Shape) -> Result<Self, Error> {
+        todo!()
+    }
+
+    fn slice(self, bounds: Bounds) -> Result<Self, Error> {
+        todo!()
+    }
+
+    fn transpose(self, axes: Axes) -> Result<Self, Error> {
+        todo!()
     }
 }

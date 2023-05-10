@@ -3,8 +3,9 @@ use std::pin::Pin;
 use futures::Stream;
 use ha_ndarray::CDatatype;
 use number_general::{DType, Number, NumberType};
+use safecast::AsType;
 
-use super::{Coord, Error, TensorInstance};
+use super::{Axes, Bounds, Coord, Error, Shape, TensorInstance, TensorTransform};
 
 pub use access::{SparseAccess, SparseInstance, SparseSlice, SparseTable};
 pub use schema::*;
@@ -35,5 +36,31 @@ impl<FE: Send + Sync + 'static, T: CDatatype + DType> TensorInstance for SparseT
             Self::Slice(slice) => slice.shape(),
             Self::View(view) => view.shape(),
         }
+    }
+}
+
+impl<FE, T> TensorTransform for SparseTensor<FE, T>
+where
+    FE: AsType<Node> + Send + Sync + 'static,
+    T: CDatatype + DType,
+{
+    fn broadcast(self, shape: Shape) -> Result<Self, Error> {
+        todo!()
+    }
+
+    fn expand(self, axes: Axes) -> Result<Self, Error> {
+        todo!()
+    }
+
+    fn reshape(self, shape: Shape) -> Result<Self, Error> {
+        todo!()
+    }
+
+    fn slice(self, bounds: Bounds) -> Result<Self, Error> {
+        todo!()
+    }
+
+    fn transpose(self, axes: Axes) -> Result<Self, Error> {
+        todo!()
     }
 }

@@ -1,11 +1,12 @@
 use std::fmt;
 
 use b_table::collate::{Collate, Collator, Overlap, OverlapsRange, OverlapsValue};
-use ha_ndarray::CDatatype;
+use ha_ndarray::{Buffer, CDatatype};
 use number_general::{DType, NumberType};
+use safecast::AsType;
 
 pub use dense::{DenseFile, DenseTensor};
-pub use sparse::{SparseTable, SparseTensor};
+pub use sparse::{Node, SparseTable, SparseTensor};
 
 pub mod dense;
 pub mod sparse;
@@ -250,22 +251,16 @@ impl<T: TensorInstance> TensorInstance for Box<T> {
     }
 }
 
-pub trait TensorTransform: TensorInstance {
-    type Broadcast: TensorInstance;
-    type Expand: TensorInstance;
-    type Reshape: TensorInstance;
-    type Slice: TensorInstance;
-    type Transpose: TensorInstance;
+pub trait TensorTransform: TensorInstance + Sized {
+    fn broadcast(self, shape: Shape) -> Result<Self, Error>;
 
-    fn broadcast(self, shape: Shape) -> Result<Self::Broadcast, Error>;
+    fn expand(self, axes: Axes) -> Result<Self, Error>;
 
-    fn expand(self, axes: Axes) -> Result<Self::Expand, Error>;
+    fn reshape(self, shape: Shape) -> Result<Self, Error>;
 
-    fn reshape(self, shape: Shape) -> Result<Self::Reshape, Error>;
+    fn slice(self, bounds: Bounds) -> Result<Self, Error>;
 
-    fn slice(self, bounds: Bounds) -> Result<Self::Slice, Error>;
-
-    fn transpose(self, axes: Axes) -> Result<Self::Transpose, Error>;
+    fn transpose(self, axes: Axes) -> Result<Self, Error>;
 }
 
 pub enum Tensor<FE, T> {
@@ -287,6 +282,32 @@ where
             Self::Dense(dense) => dense.shape(),
             Self::Sparse(sparse) => sparse.shape(),
         }
+    }
+}
+
+impl<FE, T> TensorTransform for Tensor<FE, T>
+where
+    FE: AsType<Node> + AsType<Buffer<T>> + Send + Sync + 'static,
+    T: CDatatype + DType,
+{
+    fn broadcast(self, shape: Shape) -> Result<Self, Error> {
+        todo!()
+    }
+
+    fn expand(self, axes: Axes) -> Result<Self, Error> {
+        todo!()
+    }
+
+    fn reshape(self, shape: Shape) -> Result<Self, Error> {
+        todo!()
+    }
+
+    fn slice(self, bounds: Bounds) -> Result<Self, Error> {
+        todo!()
+    }
+
+    fn transpose(self, axes: Axes) -> Result<Self, Error> {
+        todo!()
     }
 }
 
