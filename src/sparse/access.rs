@@ -3,6 +3,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::ops::Bound;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use b_table::{Range, TableLock};
@@ -188,8 +189,8 @@ where
     T: CDatatype + DType,
     Number: CastInto<T>,
 {
-    type CoordBlock = ArrayBase<u64>;
-    type ValueBlock = ArrayBase<Self::DType>;
+    type CoordBlock = ArrayBase<Vec<u64>>;
+    type ValueBlock = ArrayBase<Vec<Self::DType>>;
     type Blocks = stream::BlockCoords<Elements<T>, T>;
     type DType = T;
 
@@ -262,8 +263,8 @@ impl<S: TensorInstance> TensorInstance for SparseBroadcast<S> {
 
 #[async_trait]
 impl<S: SparseInstance> SparseInstance for SparseBroadcast<S> {
-    type CoordBlock = ArrayBase<u64>;
-    type ValueBlock = ArrayBase<Self::DType>;
+    type CoordBlock = ArrayBase<Vec<u64>>;
+    type ValueBlock = ArrayBase<Vec<Self::DType>>;
     type Blocks = stream::BlockCoords<Elements<Self::DType>, Self::DType>;
     type DType = S::DType;
 
@@ -365,8 +366,8 @@ impl<S: TensorInstance> TensorInstance for SparseExpand<S> {
 
 #[async_trait]
 impl<S: SparseInstance> SparseInstance for SparseExpand<S> {
-    type CoordBlock = ArrayBase<u64>;
-    type ValueBlock = ArrayBase<Self::DType>;
+    type CoordBlock = ArrayBase<Vec<u64>>;
+    type ValueBlock = ArrayBase<Vec<Self::DType>>;
     type Blocks = stream::BlockCoords<Elements<Self::DType>, Self::DType>;
     type DType = S::DType;
 
@@ -445,7 +446,7 @@ impl<S: TensorInstance> TensorInstance for SparseReshape<S> {
 
 #[async_trait]
 impl<S: SparseInstance> SparseInstance for SparseReshape<S> {
-    type CoordBlock = ArrayBase<u64>;
+    type CoordBlock = ArrayBase<Vec<u64>>;
     type ValueBlock = S::ValueBlock;
     type Blocks = Pin<Box<dyn Stream<Item = Result<(Self::CoordBlock, Self::ValueBlock), Error>>>>;
     type DType = S::DType;
@@ -461,11 +462,12 @@ impl<S: SparseInstance> SparseInstance for SparseReshape<S> {
 
         let source_ndim = self.source.ndim();
         let source_blocks = self.source.blocks(source_bounds).await?;
-        let source_strides = ArrayBase::new(vec![source_ndim], self.source_strides)?;
+        let source_strides =
+            ArrayBase::<Arc<Vec<_>>>::new(vec![source_ndim], Arc::new(self.source_strides))?;
 
         let ndim = self.shape.len();
-        let strides = ArrayBase::new(vec![ndim], self.strides)?;
-        let shape = ArrayBase::new(vec![ndim], self.shape)?;
+        let strides = ArrayBase::<Arc<Vec<_>>>::new(vec![ndim], Arc::new(self.strides))?;
+        let shape = ArrayBase::<Arc<Vec<_>>>::new(vec![ndim], Arc::new(self.shape))?;
 
         let blocks = source_blocks.map(move |result| {
             let (source_coords, values) = result?;
@@ -473,21 +475,23 @@ impl<S: SparseInstance> SparseInstance for SparseReshape<S> {
             debug_assert_eq!(source_coords.size() % source_ndim, 0);
             debug_assert_eq!(source_coords.size() / source_ndim, values.size());
 
-            let source_strides = source_strides.broadcast(vec![values.size(), source_ndim])?;
+            let source_strides = source_strides
+                .clone()
+                .broadcast(vec![values.size(), source_ndim])?;
 
-            let offsets = source_coords.mul(&source_strides)?;
+            let offsets = source_coords.mul(source_strides)?;
             let offsets = offsets.sum_axis(1)?;
 
             let broadcast = vec![offsets.size(), ndim];
-            let strides = strides.broadcast(broadcast.to_vec())?;
+            let strides = strides.clone().broadcast(broadcast.to_vec())?;
             let offsets = offsets
                 .expand_dims(vec![1])?
                 .broadcast(broadcast.to_vec())?;
 
-            let dims = shape.expand_dims(vec![0])?.broadcast(broadcast)?;
+            let dims = shape.clone().expand_dims(vec![0])?.broadcast(broadcast)?;
             let coords = (offsets / strides) % dims;
 
-            let coords = ArrayBase::copy(&coords)?;
+            let coords = ArrayBase::<Vec<_>>::copy(&coords)?;
 
             Result::<_, Error>::Ok((coords, values))
         });
@@ -506,8 +510,8 @@ impl<S: SparseInstance> SparseInstance for SparseReshape<S> {
         let elements = blocks
             .map(move |result| {
                 let (coords, values) = result?;
-                let coords = coords.into_data();
-                let values = values.to_vec(&queue)?;
+                let coords = coords.into_inner();
+                let values = values.read(&queue)?.to_slice()?.into_vec();
                 let coords = coords.into_par_iter().chunks(ndim).collect::<Vec<Coord>>();
 
                 Result::<_, Error>::Ok(futures::stream::iter(
@@ -718,7 +722,7 @@ where
     S: SparseInstance,
     <S::CoordBlock as NDArrayTransform>::Transpose: NDArrayRead<DType = u64>,
 {
-    type CoordBlock = ArrayBase<u64>;
+    type CoordBlock = ArrayBase<Vec<u64>>;
     type ValueBlock = S::ValueBlock;
     type Blocks = Pin<Box<dyn Stream<Item = Result<(Self::CoordBlock, Self::ValueBlock), Error>>>>;
     type DType = S::DType;

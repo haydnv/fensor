@@ -4,7 +4,7 @@ use std::{fmt, io};
 
 use async_trait::async_trait;
 use destream::de;
-use freqfs::{DirLock, FileLoad};
+use freqfs::{DirLock, FileLoad, FileReadGuardOwned};
 use futures::{stream, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use ha_ndarray::*;
 use number_general::{DType, NumberClass, NumberInstance, NumberType};
@@ -13,8 +13,6 @@ use safecast::AsType;
 use crate::{
     validate_shape, Axes, AxisBound, Bounds, Error, Shape, TensorInstance, IDEAL_BLOCK_SIZE,
 };
-
-use super::cache::Cached;
 
 type BlockShape = ha_ndarray::Shape;
 type BlockStream<Block> = Pin<Box<dyn Stream<Item = Result<Block, Error>>>>;
@@ -85,9 +83,9 @@ where
 #[async_trait]
 impl<FE, T> DenseInstance for DenseAccess<FE, T>
 where
-    FE: FileLoad + AsType<Cached<T>> + Send + Sync,
+    FE: FileLoad + AsType<Buffer<T>> + Send + Sync,
     T: CDatatype + DType + NumberInstance,
-    Cached<T>: de::FromStream<Context = ()>,
+    Buffer<T>: de::FromStream<Context = ()>,
     Box<Self>: DenseInstance,
     Self: Clone,
 {
@@ -129,7 +127,7 @@ impl<FE, T> fmt::Debug for DenseAccess<FE, T> {
 #[derive(Clone)]
 pub struct DenseFile<FE, T> {
     dir: DirLock<FE>,
-    block_map: ArrayBase<u64>,
+    block_map: ArrayBase<Vec<u64>>,
     block_size: usize,
     shape: Shape,
     dtype: PhantomData<T>,
@@ -137,7 +135,7 @@ pub struct DenseFile<FE, T> {
 
 impl<FE, T> DenseFile<FE, T>
 where
-    FE: FileLoad + AsType<Cached<T>> + Send + Sync,
+    FE: FileLoad + AsType<Buffer<T>> + Send + Sync,
     T: CDatatype + DType + NumberInstance,
 {
     pub async fn constant(dir: DirLock<FE>, shape: Shape, value: T) -> Result<Self, Error> {
@@ -202,7 +200,8 @@ where
             .map(|dim| dim as usize)
             .collect();
 
-        let block_map = ArrayBase::new(map_shape, (0u64..num_blocks as u64).into_iter().collect())?;
+        let block_map =
+            ArrayBase::<Vec<_>>::new(map_shape, (0u64..num_blocks as u64).into_iter().collect())?;
 
         Ok(Self {
             dir,
@@ -231,11 +230,11 @@ where
 #[async_trait]
 impl<FE, T> DenseInstance for DenseFile<FE, T>
 where
-    FE: FileLoad + AsType<Cached<T>>,
+    FE: FileLoad + AsType<Buffer<T>>,
     T: CDatatype + DType + 'static,
-    Cached<T>: de::FromStream<Context = ()>,
+    Buffer<T>: de::FromStream<Context = ()>,
 {
-    type Block = ArrayBase<T>;
+    type Block = ArrayBase<FileReadGuardOwned<FE, Buffer<T>>>;
     type DType = T;
 
     fn block_size(&self) -> usize {
@@ -251,10 +250,11 @@ where
             )
         })?;
 
-        let array = file.read().await?;
+        let buffer = file.read_owned().await?;
         let block_axis = block_axis_for(self.shape(), self.block_size);
-        let block_shape = block_shape_for(block_axis, &self.shape, array.data.len());
-        ArrayBase::new(block_shape, array.data.to_vec()).map_err(Error::from)
+        let block_shape = block_shape_for(block_axis, &self.shape, buffer.len());
+        ArrayBase::<FileReadGuardOwned<FE, Buffer<T>>>::new(block_shape, buffer)
+            .map_err(Error::from)
     }
 
     async fn into_blocks(self) -> Result<BlockStream<Self::Block>, Error> {
@@ -262,7 +262,7 @@ where
         let block_axis = block_axis_for(&shape, self.block_size);
         let dir = self.dir.into_read().await;
 
-        let blocks = stream::iter(self.block_map.into_data())
+        let blocks = stream::iter(self.block_map.into_inner())
             .map(move |block_id| {
                 dir.get_file(&block_id).cloned().ok_or_else(|| {
                     io::Error::new(
@@ -275,9 +275,10 @@ where
             .map_ok(|block| block.into_read())
             .try_buffered(num_cpus::get())
             .map(move |result| {
-                let array = result?;
-                let block_shape = block_shape_for(block_axis, &shape, array.data.len());
-                ArrayBase::new(block_shape, array.data.to_vec()).map_err(Error::from)
+                let buffer = result?;
+                let block_shape = block_shape_for(block_axis, &shape, buffer.len());
+                ArrayBase::<FileReadGuardOwned<FE, Buffer<T>>>::new(block_shape, buffer)
+                    .map_err(Error::from)
             });
 
         Ok(Box::pin(blocks))
@@ -294,7 +295,7 @@ impl<FE, T> fmt::Debug for DenseFile<FE, T> {
 pub struct DenseBroadcast<S> {
     source: S,
     shape: Shape,
-    block_map: ArrayBase<u64>,
+    block_map: ArrayBase<Vec<u64>>,
     block_size: usize,
 }
 
@@ -334,7 +335,7 @@ where
         let block_axis = block_axis_for(&self.shape, self.block_size);
         let block_shape = block_shape_for(block_axis, &self.shape, self.block_size);
 
-        let blocks = stream::iter(self.block_map.into_data())
+        let blocks = stream::iter(self.block_map.into_inner())
             .map(move |block_id| {
                 let source = self.source.clone();
                 async move { source.read_block(block_id).await }
@@ -436,7 +437,7 @@ pub struct DenseSlice<S> {
     source: S,
     bounds: Bounds,
     shape: Shape,
-    block_map: ArrayBase<u64>,
+    block_map: ArrayBase<Vec<u64>>,
     block_size: usize,
 }
 
@@ -464,7 +465,7 @@ impl<S: DenseInstance> DenseSlice<S> {
             .map(|dim| dim.try_into().map_err(Error::Index))
             .collect::<Result<_, _>>()?;
 
-        let block_map = ArrayBase::new(
+        let block_map = ArrayBase::<Vec<_>>::new(
             block_map_shape,
             (0..num_blocks as u64).into_iter().collect(),
         )?;
@@ -504,7 +505,7 @@ impl<S: DenseInstance> DenseSlice<S> {
         }
 
         let block_map = block_map.slice(block_map_bounds)?;
-        let block_map = ArrayBase::copy(&block_map)?;
+        let block_map = ArrayBase::<Vec<u64>>::copy(&block_map)?;
 
         let mut shape = Shape::with_capacity(source.ndim());
         for (bound, dim) in bounds.0.iter().zip(source.shape()) {
@@ -668,7 +669,7 @@ where
         }
 
         debug_assert_eq!(block_map.size(), local_bounds.len());
-        let blocks = stream::iter(block_map.into_data().into_iter().zip(local_bounds))
+        let blocks = stream::iter(block_map.into_inner().into_iter().zip(local_bounds))
             .map(move |(block_id, local_bound)| {
                 let mut block_bounds = block_bounds.to_vec();
                 let source = source.clone();
@@ -702,7 +703,7 @@ pub struct DenseTranspose<S> {
     source: S,
     shape: Shape,
     permutation: Axes,
-    block_map: ArrayBase<u64>,
+    block_map: ArrayBase<Vec<u64>>,
 }
 
 impl<S: DenseInstance> DenseTranspose<S> {
@@ -750,9 +751,9 @@ impl<S: DenseInstance> DenseTranspose<S> {
             )));
         }
 
-        let block_map = ArrayBase::new(map_shape, (0..num_blocks).into_iter().collect())?;
+        let block_map = ArrayBase::<Vec<_>>::new(map_shape, (0..num_blocks).into_iter().collect())?;
         let block_map = block_map.transpose(Some(map_axes.to_vec()))?;
-        let block_map = ArrayBase::copy(&block_map)?;
+        let block_map = ArrayBase::<Vec<_>>::copy(&block_map)?;
 
         Ok(Self {
             source,
@@ -798,7 +799,7 @@ where
     async fn into_blocks(self) -> Result<BlockStream<Self::Block>, Error> {
         let permutation = self.permutation;
 
-        let blocks = stream::iter(self.block_map.into_data())
+        let blocks = stream::iter(self.block_map.into_inner())
             .map(move |block_id| {
                 let source = self.source.clone();
                 async move { source.read_block(block_id).await }
@@ -875,7 +876,7 @@ fn div_ceil(num: u64, denom: u64) -> u64 {
 }
 
 #[inline]
-fn source_block_id_for(block_map: &ArrayBase<u64>, block_id: u64) -> Result<u64, Error> {
+fn source_block_id_for(block_map: &ArrayBase<Vec<u64>>, block_id: u64) -> Result<u64, Error> {
     block_map
         .as_slice()
         .get(block_id as usize)

@@ -20,7 +20,7 @@ b-table = { path = "../b-table", features = ["stream"] }
 destream = { path = "../destream" }
 freqfs = { path = "../freqfs", features = ["stream"] }
 futures = "0.3"
-ha-ndarray = { path = "../ha-ndarray" }
+ha-ndarray = { path = "../ha-ndarray", features = ["freqfs", "stream"] }
 number-general = { path = "../number-general", features = ["stream"] }
 num_cpus = "1.15"
 pin-project = "1.0"

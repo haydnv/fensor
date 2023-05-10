@@ -40,14 +40,15 @@ where
         pending_coords: &mut Vec<u64>,
         pending_values: &mut Vec<T>,
         ndim: usize,
-    ) -> Result<(ArrayBase<u64>, ArrayBase<T>), Error> {
+    ) -> Result<(ArrayBase<Vec<u64>>, ArrayBase<Vec<T>>), Error> {
         let num_coords = pending_values.len();
 
         debug_assert_eq!(pending_coords.len() % ndim, 0);
 
-        let values = ArrayBase::new(vec![num_coords], pending_values.drain(..).collect())?;
+        let values =
+            ArrayBase::<Vec<_>>::new(vec![num_coords], pending_values.drain(..).collect())?;
 
-        let coords = ArrayBase::new(
+        let coords = ArrayBase::<Vec<_>>::new(
             vec![pending_coords.len() / ndim, ndim],
             pending_coords.drain(..).collect(),
         )?;
@@ -61,7 +62,7 @@ where
     S: Stream<Item = Result<(Coord, T), Error>> + Unpin,
     T: CDatatype,
 {
-    type Item = Result<(ArrayBase<u64>, ArrayBase<T>), Error>;
+    type Item = Result<(ArrayBase<Vec<u64>>, ArrayBase<Vec<T>>), Error>;
 
     fn poll_next(self: Pin<&mut Self>, cxt: &mut Context) -> Poll<Option<Self::Item>> {
         let ndim = self.ndim;
