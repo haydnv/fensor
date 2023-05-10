@@ -1,5 +1,6 @@
 use std::fmt;
 
+use b_table::collate::{Collator, Overlap, OverlapsRange, OverlapsValue};
 use ha_ndarray::CDatatype;
 use number_general::{DType, NumberType};
 
@@ -20,11 +21,82 @@ const IDEAL_BLOCK_SIZE: usize = 24;
 #[cfg(not(debug_assertions))]
 const IDEAL_BLOCK_SIZE: usize = 65_536;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AxisBound {
     At(u64),
     In(u64, u64, u64),
     Of(Vec<u64>),
+}
+
+impl OverlapsRange<AxisBound, Collator<u64>> for AxisBound {
+    fn overlaps(&self, other: &AxisBound, collator: &Collator<u64>) -> Overlap {
+        #[inline]
+        fn invert(overlap: Overlap) -> Overlap {
+            match overlap {
+                Overlap::Less => Overlap::Greater,
+                Overlap::Greater => Overlap::Less,
+
+                Overlap::WideLess => Overlap::Narrow,
+                Overlap::Wide => Overlap::Narrow,
+                Overlap::WideGreater => Overlap::Narrow,
+
+                Overlap::Equal => Overlap::Equal,
+
+                overlap => unreachable!("range overlaps index: {:?}", overlap),
+            }
+        }
+
+        #[inline]
+        fn range_from(indices: &[u64]) -> std::ops::Range<u64> {
+            debug_assert!(!indices.is_empty());
+            let start = *indices.iter().fold(&u64::MAX, Ord::min);
+            let stop = *indices.iter().fold(&0, Ord::max);
+            start..stop
+        }
+
+        if self == other {
+            return Overlap::Equal;
+        }
+
+        match self {
+            Self::At(this) => match other {
+                Self::At(that) => this.cmp(that).into(),
+                Self::In(start, stop, _step) => {
+                    let that = *start..*stop;
+                    invert(that.overlaps_value(this, collator))
+                }
+                Self::Of(that) if that.is_empty() => Overlap::Wide,
+                Self::Of(that) => invert(range_from(that).overlaps_value(this, collator)),
+            },
+            Self::In(start, stop, _step) => {
+                let this = *start..*stop;
+
+                match other {
+                    Self::At(that) => this.overlaps_value(that, collator),
+                    Self::In(start, stop, _step) => {
+                        let that = *start..*stop;
+                        this.overlaps(&that, collator)
+                    }
+                    Self::Of(that) if that.is_empty() => Overlap::Wide,
+                    Self::Of(that) => this.overlaps(&range_from(that), collator),
+                }
+            }
+            Self::Of(this) if this.is_empty() => Overlap::Narrow,
+            Self::Of(this) => {
+                let this = range_from(this);
+
+                match other {
+                    Self::At(that) => this.overlaps_value(that, collator),
+                    Self::In(start, stop, _step) => {
+                        let that = *start..*stop;
+                        this.overlaps(&that, collator)
+                    }
+                    Self::Of(that) if that.is_empty() => Overlap::Wide,
+                    Self::Of(that) => this.overlaps(&range_from(that), collator),
+                }
+            }
+        }
+    }
 }
 
 impl TryFrom<AxisBound> for ha_ndarray::AxisBound {
@@ -58,6 +130,28 @@ impl TryFrom<AxisBound> for ha_ndarray::AxisBound {
 
 #[derive(Clone, Debug, Default)]
 pub struct Bounds(Vec<AxisBound>);
+
+impl OverlapsRange<Bounds, Collator<u64>> for Bounds {
+    fn overlaps(&self, other: &Bounds, collator: &Collator<u64>) -> Overlap {
+        match (self.0.is_empty(), other.0.is_empty()) {
+            (true, true) => return Overlap::Equal,
+            (true, false) => return Overlap::Greater,
+            (false, true) => return Overlap::Narrow,
+            (false, false) => {}
+        }
+
+        let mut overlap = Overlap::Equal;
+        for (this, that) in self.0.iter().zip(&other.0) {
+            match this.overlaps(that, collator) {
+                Overlap::Less => return Overlap::Less,
+                Overlap::Greater => return Overlap::Greater,
+                axis_overlap => overlap = overlap.then(axis_overlap),
+            }
+        }
+
+        overlap
+    }
+}
 
 impl FromIterator<AxisBound> for Bounds {
     fn from_iter<I: IntoIterator<Item = AxisBound>>(iter: I) -> Self {
