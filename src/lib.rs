@@ -1,6 +1,6 @@
 use std::fmt;
 
-use b_table::collate::{Collator, Overlap, OverlapsRange, OverlapsValue};
+use b_table::collate::{Collate, Collator, Overlap, OverlapsRange, OverlapsValue};
 use ha_ndarray::CDatatype;
 use number_general::{DType, NumberType};
 
@@ -46,14 +46,6 @@ impl OverlapsRange<AxisBound, Collator<u64>> for AxisBound {
             }
         }
 
-        #[inline]
-        fn range_from(indices: &[u64]) -> std::ops::Range<u64> {
-            debug_assert!(!indices.is_empty());
-            let start = *indices.iter().fold(&u64::MAX, Ord::min);
-            let stop = *indices.iter().fold(&0, Ord::max);
-            start..stop
-        }
-
         if self == other {
             return Overlap::Equal;
         }
@@ -66,7 +58,7 @@ impl OverlapsRange<AxisBound, Collator<u64>> for AxisBound {
                     invert(that.overlaps_value(this, collator))
                 }
                 Self::Of(that) if that.is_empty() => Overlap::Wide,
-                Self::Of(that) => invert(range_from(that).overlaps_value(this, collator)),
+                Self::Of(that) => invert(to_range(that).overlaps_value(this, collator)),
             },
             Self::In(start, stop, _step) => {
                 let this = *start..*stop;
@@ -78,12 +70,12 @@ impl OverlapsRange<AxisBound, Collator<u64>> for AxisBound {
                         this.overlaps(&that, collator)
                     }
                     Self::Of(that) if that.is_empty() => Overlap::Wide,
-                    Self::Of(that) => this.overlaps(&range_from(that), collator),
+                    Self::Of(that) => this.overlaps(&to_range(that), collator),
                 }
             }
             Self::Of(this) if this.is_empty() => Overlap::Narrow,
             Self::Of(this) => {
-                let this = range_from(this);
+                let this = to_range(this);
 
                 match other {
                     Self::At(that) => this.overlaps_value(that, collator),
@@ -92,11 +84,33 @@ impl OverlapsRange<AxisBound, Collator<u64>> for AxisBound {
                         this.overlaps(&that, collator)
                     }
                     Self::Of(that) if that.is_empty() => Overlap::Wide,
-                    Self::Of(that) => this.overlaps(&range_from(that), collator),
+                    Self::Of(that) => this.overlaps(&to_range(that), collator),
                 }
             }
         }
     }
+}
+
+impl OverlapsValue<u64, Collator<u64>> for AxisBound {
+    fn overlaps_value(&self, value: &u64, collator: &Collator<u64>) -> Overlap {
+        match self {
+            Self::At(this) => collator.cmp(this, value).into(),
+            Self::In(start, stop, _step) => {
+                let this = *start..*stop;
+                this.overlaps_value(value, collator)
+            }
+            Self::Of(this) if this.is_empty() => Overlap::Narrow,
+            Self::Of(this) => to_range(this).overlaps_value(value, collator),
+        }
+    }
+}
+
+#[inline]
+fn to_range(indices: &[u64]) -> std::ops::Range<u64> {
+    debug_assert!(!indices.is_empty());
+    let start = *indices.iter().fold(&u64::MAX, Ord::min);
+    let stop = *indices.iter().fold(&0, Ord::max);
+    start..stop
 }
 
 impl TryFrom<AxisBound> for ha_ndarray::AxisBound {
@@ -143,6 +157,26 @@ impl OverlapsRange<Bounds, Collator<u64>> for Bounds {
         let mut overlap = Overlap::Equal;
         for (this, that) in self.0.iter().zip(&other.0) {
             match this.overlaps(that, collator) {
+                Overlap::Less => return Overlap::Less,
+                Overlap::Greater => return Overlap::Greater,
+                axis_overlap => overlap = overlap.then(axis_overlap),
+            }
+        }
+
+        overlap
+    }
+}
+
+impl OverlapsValue<Coord, Collator<u64>> for Bounds {
+    fn overlaps_value(&self, value: &Coord, collator: &Collator<u64>) -> Overlap {
+        let mut overlap = if self.0.len() == value.len() {
+            Overlap::Equal
+        } else {
+            Overlap::Wide
+        };
+
+        for (axis_bound, i) in self.0.iter().zip(value) {
+            match axis_bound.overlaps_value(i, collator) {
                 Overlap::Less => return Overlap::Less,
                 Overlap::Greater => return Overlap::Greater,
                 axis_overlap => overlap = overlap.then(axis_overlap),
