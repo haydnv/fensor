@@ -169,12 +169,6 @@ where
     }
 }
 
-impl<FE, T> From<SparseBroadcast<FE, T>> for SparseAccess<FE, T> {
-    fn from(accessor: SparseBroadcast<FE, T>) -> Self {
-        Self::Broadcast(Box::new(accessor))
-    }
-}
-
 impl<FE, T> fmt::Debug for SparseAccess<FE, T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         array_dispatch!(self, this, this.fmt(f))
@@ -397,6 +391,12 @@ where
     }
 }
 
+impl<FE, T> From<SparseBroadcast<FE, T>> for SparseAccess<FE, T> {
+    fn from(accessor: SparseBroadcast<FE, T>) -> Self {
+        Self::Broadcast(Box::new(accessor))
+    }
+}
+
 impl<FE, T> fmt::Debug for SparseBroadcast<FE, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "broadcasted sparse tensor with shape {:?}", self.shape)
@@ -591,6 +591,17 @@ impl<S: SparseInstance + Clone> SparseInstance for SparseBroadcastAxis<S> {
     }
 }
 
+impl<FE, T, S: Into<SparseAccess<FE, T>>> From<SparseBroadcastAxis<S>> for SparseAccess<FE, T> {
+    fn from(broadcast: SparseBroadcastAxis<S>) -> Self {
+        Self::BroadcastAxis(Box::new(SparseBroadcastAxis {
+            source: broadcast.source.into(),
+            axis: broadcast.axis,
+            dim: broadcast.dim,
+            shape: broadcast.shape,
+        }))
+    }
+}
+
 impl<S: fmt::Debug> fmt::Debug for SparseBroadcastAxis<S> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "broadcast of {:?} axis {}", self.source, self.axis)
@@ -685,6 +696,16 @@ impl<S: SparseInstance> SparseInstance for SparseExpand<S> {
         });
 
         Ok(Box::pin(elements))
+    }
+}
+
+impl<FE, T, S: Into<SparseAccess<FE, T>>> From<SparseExpand<S>> for SparseAccess<FE, T> {
+    fn from(expand: SparseExpand<S>) -> Self {
+        Self::Expand(Box::new(SparseExpand {
+            source: expand.source.into(),
+            shape: expand.shape,
+            axes: expand.axes,
+        }))
     }
 }
 
@@ -822,6 +843,17 @@ impl<S: SparseInstance> SparseInstance for SparseReshape<S> {
             .try_flatten();
 
         Ok(Box::pin(elements))
+    }
+}
+
+impl<FE, T, S: Into<SparseAccess<FE, T>>> From<SparseReshape<S>> for SparseAccess<FE, T> {
+    fn from(reshape: SparseReshape<S>) -> Self {
+        Self::Reshape(Box::new(SparseReshape {
+            source: reshape.source.into(),
+            source_strides: reshape.source_strides,
+            shape: reshape.shape,
+            strides: reshape.strides,
+        }))
     }
 }
 
@@ -1008,6 +1040,16 @@ where
         };
 
         self.source.elements(source_bounds, source_order).await
+    }
+}
+
+impl<FE, T, S: Into<SparseAccess<FE, T>>> From<SparseSlice<S>> for SparseAccess<FE, T> {
+    fn from(slice: SparseSlice<S>) -> Self {
+        Self::Slice(Box::new(SparseSlice {
+            source: slice.source.into(),
+            bounds: slice.bounds,
+            shape: slice.shape,
+        }))
     }
 }
 
