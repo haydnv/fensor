@@ -47,12 +47,22 @@ impl<T: DenseInstance> DenseInstance for Box<T> {
     }
 }
 
-#[derive(Clone)]
 pub enum DenseAccess<FE, T> {
     File(DenseFile<FE, T>),
     Broadcast(Box<DenseBroadcast<Self>>),
     Reshape(Box<DenseReshape<Self>>),
     Slice(Box<DenseSlice<Self>>),
+}
+
+impl<FE, T> Clone for DenseAccess<FE, T> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::File(file) => Self::File(file.clone()),
+            Self::Broadcast(broadcast) => Self::Broadcast(broadcast.clone()),
+            Self::Reshape(reshape) => Self::Reshape(reshape.clone()),
+            Self::Slice(slice) => Self::Slice(slice.clone()),
+        }
+    }
 }
 
 macro_rules! array_dispatch {
@@ -124,13 +134,24 @@ impl<FE, T> fmt::Debug for DenseAccess<FE, T> {
     }
 }
 
-#[derive(Clone)]
 pub struct DenseFile<FE, T> {
     dir: DirLock<FE>,
     block_map: ArrayBase<Vec<u64>>,
     block_size: usize,
     shape: Shape,
     dtype: PhantomData<T>,
+}
+
+impl<FE, T> Clone for DenseFile<FE, T> {
+    fn clone(&self) -> Self {
+        Self {
+            dir: self.dir.clone(),
+            block_map: self.block_map.clone(),
+            block_size: self.block_size,
+            shape: self.shape.to_vec(),
+            dtype: PhantomData,
+        }
+    }
 }
 
 impl<FE, T> DenseFile<FE, T>
@@ -297,6 +318,48 @@ pub struct DenseBroadcast<S> {
     shape: Shape,
     block_map: ArrayBase<Vec<u64>>,
     block_size: usize,
+}
+
+impl<S: DenseInstance> DenseBroadcast<S> {
+    pub fn new(source: S, shape: Shape) -> Result<Self, Error> {
+        let num_blocks = div_ceil(source.size(), source.block_size() as u64);
+        let block_axis = block_axis_for(source.shape(), source.block_size());
+        let source_block_shape = block_shape_for(block_axis, source.shape(), source.block_size());
+
+        let mut block_shape = BlockShape::with_capacity(source_block_shape.len());
+        block_shape.push(source_block_shape[0]);
+        block_shape.extend(
+            shape
+                .iter()
+                .rev()
+                .take(source_block_shape.len() - 1)
+                .rev()
+                .copied()
+                .map(|dim| dim as usize),
+        );
+
+        let block_size = block_shape.iter().product();
+
+        let mut block_map_shape = BlockShape::with_capacity(source.ndim());
+        block_map_shape.extend(
+            shape
+                .iter()
+                .take(block_axis)
+                .copied()
+                .map(|dim| dim as usize),
+        );
+        block_map_shape.push(shape[block_axis] as usize / source_block_shape[0]);
+
+        let block_map =
+            ArrayBase::<Vec<_>>::new(block_map_shape, (0..num_blocks).into_iter().collect())?;
+
+        Ok(Self {
+            source,
+            shape,
+            block_map,
+            block_size,
+        })
+    }
 }
 
 impl<S: TensorInstance> TensorInstance for DenseBroadcast<S> {
