@@ -156,6 +156,25 @@ impl TryFrom<AxisBound> for ha_ndarray::AxisBound {
 #[derive(Clone, Debug, Default)]
 pub struct Bounds(Vec<AxisBound>);
 
+impl Bounds {
+    fn all(shape: &[u64]) -> Self {
+        let bounds = shape
+            .iter()
+            .copied()
+            .map(|dim| AxisBound::In(0, dim, 1))
+            .collect();
+        Self(bounds)
+    }
+
+    fn normalize(mut self, shape: &[u64]) -> Self {
+        for dim in shape.iter().skip(self.0.len()).copied() {
+            self.0.push(AxisBound::In(0, dim, 1))
+        }
+
+        self
+    }
+}
+
 impl OverlapsRange<Bounds, Collator<u64>> for Bounds {
     fn overlaps(&self, other: &Bounds, collator: &Collator<u64>) -> Overlap {
         match (self.0.is_empty(), other.0.is_empty()) {

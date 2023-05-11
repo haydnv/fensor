@@ -556,12 +556,15 @@ impl<S: SparseInstance> SparseInstance for SparseReshape<S> {
             .map(move |result| {
                 let (coords, values) = result?;
                 let coords = coords.into_inner();
-                let values = values.read(&queue)?.to_slice()?.into_vec();
-                let coords = coords.into_par_iter().chunks(ndim).collect::<Vec<Coord>>();
+                let values = values.read(&queue)?.to_slice()?;
+                let tuples = coords
+                    .into_par_iter()
+                    .chunks(ndim)
+                    .zip(values.as_ref().into_par_iter().copied())
+                    .map(Ok)
+                    .collect::<Vec<_>>();
 
-                Result::<_, Error>::Ok(futures::stream::iter(
-                    coords.into_iter().zip(values).map(Ok),
-                ))
+                Result::<_, Error>::Ok(futures::stream::iter(tuples))
             })
             .try_flatten();
 
@@ -788,7 +791,7 @@ where
     S: SparseInstance,
     <S::CoordBlock as NDArrayTransform>::Transpose: NDArrayRead<DType = u64>,
 {
-    type CoordBlock = ArrayView<S::CoordBlock>;
+    type CoordBlock = <S::CoordBlock as NDArrayTransform>::Transpose;
     type ValueBlock = S::ValueBlock;
     type Blocks = Pin<Box<dyn Stream<Item = Result<(Self::CoordBlock, Self::ValueBlock), Error>>>>;
     type DType = S::DType;
@@ -797,26 +800,47 @@ where
         debug_assert!(validate_bounds(&bounds, self.shape()).is_ok());
         debug_assert!(validate_order(&order, self.ndim()));
 
-        todo!()
+        let bounds = bounds.normalize(self.shape());
+        debug_assert_eq!(bounds.0.len(), self.ndim());
+
+        let permutation = self.permutation;
+        let mut source_bounds = Bounds::all(self.source.shape());
+        for axis in 0..bounds.0.len() {
+            source_bounds.0[permutation[axis]] = bounds.0[axis].clone();
+        }
+
+        let source_order = order.into_iter().map(|x| permutation[x]).collect();
+
+        let source_blocks = self.source.blocks(source_bounds, source_order).await?;
+
+        let blocks = source_blocks.map(move |result| {
+            let (source_coords, values) = result?;
+            let coords = source_coords.transpose(Some(permutation.to_vec()))?;
+            Ok((coords, values))
+        });
+
+        Ok(Box::pin(blocks))
     }
 
     async fn elements(self, bounds: Bounds, order: Axes) -> Result<Elements<Self::DType>, Error> {
         let ndim = self.ndim();
-        let size_hint = size_hint(self.size());
-        let blocks = self.blocks(bounds, order).await?;
 
         let context = ha_ndarray::Context::default()?;
-        let queue = ha_ndarray::Queue::new(context, size_hint)?;
+        let queue = ha_ndarray::Queue::new(context, size_hint(self.size()))?;
+
+        let blocks = self.blocks(bounds, order).await?;
 
         let elements = blocks
             .map(move |result| {
                 let (coords, values) = result?;
-                let coords = coords.read(&queue)?.to_slice()?.into_vec();
-                let values = values.read(&queue)?.to_slice()?.into_vec();
+                let coords = coords.read(&queue)?.to_slice()?;
+                let values = values.read(&queue)?.to_slice()?;
                 let tuples = coords
+                    .as_ref()
                     .into_par_iter()
+                    .copied()
                     .chunks(ndim)
-                    .zip(values)
+                    .zip(values.as_ref().into_par_iter().copied())
                     .map(Ok)
                     .collect::<Vec<_>>();
 
