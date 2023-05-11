@@ -29,6 +29,16 @@ pub enum AxisBound {
     Of(Vec<u64>),
 }
 
+impl AxisBound {
+    pub fn is_index(&self) -> bool {
+        if let Self::At(_) = self {
+            true
+        } else {
+            false
+        }
+    }
+}
+
 impl OverlapsRange<AxisBound, Collator<u64>> for AxisBound {
     fn overlaps(&self, other: &AxisBound, collator: &Collator<u64>) -> Overlap {
         #[inline]
@@ -326,6 +336,40 @@ fn strides_for(shape: &[u64], ndim: usize) -> Strides {
     });
 
     zeros.chain(strides).collect()
+}
+
+#[inline]
+fn validate_order(order: &[usize], ndim: usize) -> bool {
+    order.len() == ndim && order.iter().all(|x| x < &ndim)
+}
+
+#[inline]
+fn validate_bound(bound: &AxisBound, dim: &u64) -> bool {
+    match bound {
+        AxisBound::At(i) => i < dim,
+        AxisBound::In(start, stop, _step) => {
+            if start > dim || stop > dim {
+                false
+            } else {
+                start < stop
+            }
+        }
+        AxisBound::Of(indices) => indices.iter().all(|i| i < dim),
+    }
+}
+
+#[inline]
+fn validate_bounds(bounds: &Bounds, shape: &[u64]) -> Result<(), Error> {
+    for (x, (bound, dim)) in bounds.0.iter().zip(shape).enumerate() {
+        if !validate_bound(bound, dim) {
+            return Err(Error::Bounds(format!(
+                "invalid bound for axis {} with dimension {}: {:?}",
+                x, dim, bound
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 #[inline]

@@ -15,7 +15,10 @@ use number_general::{DType, Number, NumberCollator, NumberType};
 use rayon::prelude::*;
 use safecast::{AsType, CastInto};
 
-use crate::{strides_for, Axes, AxisBound, Bounds, Coord, Error, Shape, Strides, TensorInstance};
+use crate::{
+    strides_for, validate_bounds, validate_order, Axes, AxisBound, Bounds, Coord, Error, Shape,
+    Strides, TensorInstance,
+};
 
 use super::schema::{IndexSchema, Schema};
 use super::stream;
@@ -28,9 +31,9 @@ pub trait SparseInstance: TensorInstance + fmt::Debug {
     type Blocks: Stream<Item = Result<(Self::CoordBlock, Self::ValueBlock), Error>>;
     type DType: CDatatype + DType;
 
-    async fn blocks(self, bounds: Bounds) -> Result<Self::Blocks, Error>;
+    async fn blocks(self, bounds: Bounds, order: Axes) -> Result<Self::Blocks, Error>;
 
-    async fn elements(self, bounds: Bounds) -> Result<Elements<Self::DType>, Error>;
+    async fn elements(self, bounds: Bounds, order: Axes) -> Result<Elements<Self::DType>, Error>;
 
     async fn filled_at(
         self,
@@ -42,7 +45,13 @@ pub trait SparseInstance: TensorInstance + fmt::Debug {
     {
         let ndim = self.ndim();
 
-        self.elements(bounds)
+        let elided = (0..ndim).filter(|x| !axes.contains(x));
+
+        let mut order = Vec::with_capacity(ndim);
+        order.copy_from_slice(&axes);
+        order.extend(elided);
+
+        self.elements(bounds, order)
             .map_ok(|elements| stream::FilledAt::new(elements, axes, ndim))
             .await
     }
@@ -91,38 +100,38 @@ where
     type Blocks = Pin<Box<dyn Stream<Item = Result<(Array<u64>, Array<T>), Error>>>>;
     type DType = T;
 
-    async fn blocks(self, bounds: Bounds) -> Result<Self::Blocks, Error> {
+    async fn blocks(self, bounds: Bounds, order: Axes) -> Result<Self::Blocks, Error> {
         match self {
             Self::Table(table) => {
-                let blocks = table.blocks(bounds).await?;
+                let blocks = table.blocks(bounds, order).await?;
                 let blocks =
                     blocks.map_ok(|(coords, values)| (Array::from(coords), Array::from(values)));
 
                 Ok(Box::pin(blocks))
             }
             Self::Broadcast(broadcast) => {
-                let blocks = broadcast.blocks(bounds).await?;
+                let blocks = broadcast.blocks(bounds, order).await?;
                 let blocks =
                     blocks.map_ok(|(coords, values)| (Array::from(coords), Array::from(values)));
 
                 Ok(Box::pin(blocks))
             }
             Self::Expand(expand) => {
-                let blocks = expand.blocks(bounds).await?;
+                let blocks = expand.blocks(bounds, order).await?;
                 let blocks =
                     blocks.map_ok(|(coords, values)| (Array::from(coords), Array::from(values)));
 
                 Ok(Box::pin(blocks))
             }
             Self::Reshape(reshape) => {
-                let blocks = reshape.blocks(bounds).await?;
+                let blocks = reshape.blocks(bounds, order).await?;
                 let blocks =
                     blocks.map_ok(|(coords, values)| (Array::from(coords), Array::from(values)));
 
                 Ok(Box::pin(blocks))
             }
             Self::Slice(slice) => {
-                let blocks = slice.blocks(bounds).await?;
+                let blocks = slice.blocks(bounds, order).await?;
                 let blocks =
                     blocks.map_ok(|(coords, values)| (Array::from(coords), Array::from(values)));
 
@@ -131,8 +140,8 @@ where
         }
     }
 
-    async fn elements(self, bounds: Bounds) -> Result<Elements<Self::DType>, Error> {
-        array_dispatch!(self, this, this.elements(bounds).await)
+    async fn elements(self, bounds: Bounds, order: Axes) -> Result<Elements<Self::DType>, Error> {
+        array_dispatch!(self, this, this.elements(bounds, order).await)
     }
 }
 
@@ -195,15 +204,18 @@ where
     type Blocks = stream::BlockCoords<Elements<T>, T>;
     type DType = T;
 
-    async fn blocks(self, bounds: Bounds) -> Result<Self::Blocks, Error> {
+    async fn blocks(self, bounds: Bounds, order: Axes) -> Result<Self::Blocks, Error> {
         let ndim = self.ndim();
-        let elements = self.elements(bounds).await?;
+        let elements = self.elements(bounds, order).await?;
         Ok(stream::BlockCoords::new(elements, ndim))
     }
 
-    async fn elements(self, bounds: Bounds) -> Result<Elements<Self::DType>, Error> {
+    async fn elements(self, bounds: Bounds, order: Axes) -> Result<Elements<Self::DType>, Error> {
+        debug_assert!(validate_bounds(&bounds, self.shape()).is_ok());
+        debug_assert!(validate_order(&order, self.ndim()));
+
         let range = range_from_bounds(&bounds, self.shape())?;
-        let rows = self.table.rows(range, &[], false).await?;
+        let rows = self.table.rows(range, &order, false).await?;
         let elements = rows.map_ok(|row| unwrap_row(row)).map_err(Error::from);
         Ok(Box::pin(elements))
     }
@@ -273,13 +285,16 @@ impl<S: SparseInstance> SparseInstance for SparseBroadcast<S> {
     type Blocks = stream::BlockCoords<Elements<Self::DType>, Self::DType>;
     type DType = S::DType;
 
-    async fn blocks(self, bounds: Bounds) -> Result<Self::Blocks, Error> {
+    async fn blocks(self, bounds: Bounds, order: Axes) -> Result<Self::Blocks, Error> {
         let ndim = self.ndim();
-        let elements = self.elements(bounds).await?;
+        let elements = self.elements(bounds, order).await?;
         Ok(stream::BlockCoords::new(elements, ndim))
     }
 
-    async fn elements(self, bounds: Bounds) -> Result<Elements<Self::DType>, Error> {
+    async fn elements(self, bounds: Bounds, order: Axes) -> Result<Elements<Self::DType>, Error> {
+        debug_assert!(validate_bounds(&bounds, self.shape()).is_ok());
+        debug_assert!(validate_order(&order, self.ndim()));
+
         let (source_bounds, dim) = if bounds.0.len() > self.axis {
             let bdim = match &bounds.0[self.axis] {
                 AxisBound::At(i) if *i < self.dim => Ok(1),
@@ -298,8 +313,9 @@ impl<S: SparseInstance> SparseInstance for SparseBroadcast<S> {
         };
 
         if self.axis == self.ndim() - 1 {
-            let source_elements = self.source.elements(source_bounds).await?;
+            let source_elements = self.source.elements(source_bounds, order).await?;
 
+            // TODO: write a range to a slice of a coordinate block instead
             let elements = source_elements
                 .map_ok(move |(source_coord, value)| {
                     futures::stream::iter(0..dim).map(move |i| {
@@ -376,13 +392,16 @@ impl<S: SparseInstance> SparseInstance for SparseExpand<S> {
     type Blocks = stream::BlockCoords<Elements<Self::DType>, Self::DType>;
     type DType = S::DType;
 
-    async fn blocks(self, bounds: Bounds) -> Result<Self::Blocks, Error> {
+    async fn blocks(self, bounds: Bounds, order: Axes) -> Result<Self::Blocks, Error> {
         let ndim = self.ndim();
-        let elements = self.elements(bounds).await?;
+        let elements = self.elements(bounds, order).await?;
         Ok(stream::BlockCoords::new(elements, ndim))
     }
 
-    async fn elements(self, bounds: Bounds) -> Result<Elements<Self::DType>, Error> {
+    async fn elements(self, bounds: Bounds, order: Axes) -> Result<Elements<Self::DType>, Error> {
+        debug_assert!(validate_bounds(&bounds, self.shape()).is_ok());
+        debug_assert!(validate_order(&order, self.ndim()));
+
         let mut source_bounds = bounds;
         for x in self.axes.iter().rev().copied() {
             if x < source_bounds.0.len() {
@@ -390,11 +409,16 @@ impl<S: SparseInstance> SparseInstance for SparseExpand<S> {
             }
         }
 
+        let mut source_order = order;
+        for x in self.axes.iter().rev().copied() {
+            source_order.remove(x);
+        }
+
         let ndim = self.ndim();
         let axes = self.axes;
         debug_assert_eq!(self.source.ndim() + 1, ndim);
 
-        let source_elements = self.source.elements(source_bounds).await?;
+        let source_elements = self.source.elements(source_bounds, source_order).await?;
 
         let elements = source_elements.map_ok(move |(source_coord, value)| {
             let mut coord = Coord::with_capacity(ndim);
@@ -456,7 +480,10 @@ impl<S: SparseInstance> SparseInstance for SparseReshape<S> {
     type Blocks = Pin<Box<dyn Stream<Item = Result<(Self::CoordBlock, Self::ValueBlock), Error>>>>;
     type DType = S::DType;
 
-    async fn blocks(self, bounds: Bounds) -> Result<Self::Blocks, Error> {
+    async fn blocks(self, bounds: Bounds, order: Axes) -> Result<Self::Blocks, Error> {
+        debug_assert!(validate_bounds(&bounds, self.shape()).is_ok());
+        debug_assert!(validate_order(&order, self.ndim()));
+
         let source_bounds = if bounds.0.is_empty() {
             Ok(bounds)
         } else {
@@ -465,8 +492,21 @@ impl<S: SparseInstance> SparseInstance for SparseReshape<S> {
             )))
         }?;
 
+        let source_order = if order
+            .iter()
+            .copied()
+            .zip(0..self.ndim())
+            .all(|(x, o)| x == o)
+        {
+            Ok(order)
+        } else {
+            Err(Error::Bounds(format!(
+                "cannot transpose a reshaped sparse tensor (consider making a copy first)"
+            )))
+        }?;
+
         let source_ndim = self.source.ndim();
-        let source_blocks = self.source.blocks(source_bounds).await?;
+        let source_blocks = self.source.blocks(source_bounds, source_order).await?;
         let source_strides =
             ArrayBase::<Arc<Vec<_>>>::new(vec![source_ndim], Arc::new(self.source_strides))?;
 
@@ -504,13 +544,13 @@ impl<S: SparseInstance> SparseInstance for SparseReshape<S> {
         Ok(Box::pin(blocks))
     }
 
-    async fn elements(self, bounds: Bounds) -> Result<Elements<Self::DType>, Error> {
+    async fn elements(self, bounds: Bounds, order: Axes) -> Result<Elements<Self::DType>, Error> {
         let ndim = self.shape.len();
 
         let context = ha_ndarray::Context::default()?;
         let queue = ha_ndarray::Queue::new(context, size_hint(self.size()))?;
 
-        let blocks = self.blocks(bounds).await?;
+        let blocks = self.blocks(bounds, order).await?;
 
         let elements = blocks
             .map(move |result| {
@@ -645,6 +685,19 @@ where
             Ok(Bounds(source_bounds))
         }
     }
+
+    fn source_order(&self, order: Axes) -> Result<Axes, Error> {
+        debug_assert!(validate_order(&order, self.ndim()));
+
+        let mut source_axes = Vec::with_capacity(self.ndim());
+        for (x, bound) in self.bounds.0.iter().enumerate() {
+            if !bound.is_index() {
+                source_axes.push(x);
+            }
+        }
+
+        Ok(order.into_iter().map(|x| source_axes[x]).collect())
+    }
 }
 
 impl<S> TensorInstance for SparseSlice<S>
@@ -670,24 +723,32 @@ where
     type Blocks = S::Blocks;
     type DType = S::DType;
 
-    async fn blocks(self, bounds: Bounds) -> Result<Self::Blocks, Error> {
+    async fn blocks(self, bounds: Bounds, order: Axes) -> Result<Self::Blocks, Error> {
+        debug_assert!(validate_bounds(&bounds, self.shape()).is_ok());
+
+        let source_order = self.source_order(order)?;
+
         let source_bounds = if bounds.0.is_empty() {
             self.bounds
         } else {
             self.source_bounds(bounds)?
         };
 
-        self.source.blocks(source_bounds).await
+        self.source.blocks(source_bounds, source_order).await
     }
 
-    async fn elements(self, bounds: Bounds) -> Result<Elements<Self::DType>, Error> {
+    async fn elements(self, bounds: Bounds, order: Axes) -> Result<Elements<Self::DType>, Error> {
+        debug_assert!(validate_bounds(&bounds, self.shape()).is_ok());
+
+        let source_order = self.source_order(order)?;
+
         let source_bounds = if bounds.0.is_empty() {
             self.bounds
         } else {
             self.source_bounds(bounds)?
         };
 
-        self.source.elements(source_bounds).await
+        self.source.elements(source_bounds, source_order).await
     }
 }
 
@@ -727,17 +788,43 @@ where
     S: SparseInstance,
     <S::CoordBlock as NDArrayTransform>::Transpose: NDArrayRead<DType = u64>,
 {
-    type CoordBlock = ArrayBase<Vec<u64>>;
+    type CoordBlock = ArrayView<S::CoordBlock>;
     type ValueBlock = S::ValueBlock;
     type Blocks = Pin<Box<dyn Stream<Item = Result<(Self::CoordBlock, Self::ValueBlock), Error>>>>;
     type DType = S::DType;
 
-    async fn blocks(self, _bounds: Bounds) -> Result<Self::Blocks, Error> {
-        todo!("support an order parameter in SparseInstance::blocks")
+    async fn blocks(self, bounds: Bounds, order: Axes) -> Result<Self::Blocks, Error> {
+        debug_assert!(validate_bounds(&bounds, self.shape()).is_ok());
+        debug_assert!(validate_order(&order, self.ndim()));
+
+        todo!()
     }
 
-    async fn elements(self, _bounds: Bounds) -> Result<Elements<Self::DType>, Error> {
-        todo!("support an order parameter in SparseInstance::elements")
+    async fn elements(self, bounds: Bounds, order: Axes) -> Result<Elements<Self::DType>, Error> {
+        let ndim = self.ndim();
+        let size_hint = size_hint(self.size());
+        let blocks = self.blocks(bounds, order).await?;
+
+        let context = ha_ndarray::Context::default()?;
+        let queue = ha_ndarray::Queue::new(context, size_hint)?;
+
+        let elements = blocks
+            .map(move |result| {
+                let (coords, values) = result?;
+                let coords = coords.read(&queue)?.to_slice()?.into_vec();
+                let values = values.read(&queue)?.to_slice()?.into_vec();
+                let tuples = coords
+                    .into_par_iter()
+                    .chunks(ndim)
+                    .zip(values)
+                    .map(Ok)
+                    .collect::<Vec<_>>();
+
+                Result::<_, Error>::Ok(futures::stream::iter(tuples))
+            })
+            .try_flatten();
+
+        Ok(Box::pin(elements))
     }
 }
 
@@ -782,41 +869,17 @@ fn range_from_bounds(bounds: &Bounds, shape: &[u64]) -> Result<Range<usize, Numb
     for (x, bound) in bounds.0.iter().enumerate() {
         match bound {
             AxisBound::At(i) => {
-                if *i >= shape[x] {
-                    return Err(Error::Bounds(format!(
-                        "invalid index for axis {}: {}",
-                        x, i
-                    )));
-                }
-
                 range.insert(x, b_table::ColumnRange::Eq(Number::from(*i)));
             }
-            AxisBound::In(start, stop, step) => {
-                if stop < start {
-                    return Err(Error::Bounds(format!(
-                        "invalid range for axis {}: [{}, {})",
-                        x, start, stop
-                    )));
-                } else if *step != 1 {
-                    return Err(Error::Bounds(format!(
-                        "sparse tensor does not support stride {}",
-                        step
-                    )));
-                } else if *stop > shape[x] {
-                    return Err(Error::Bounds(format!(
-                        "index {} is out of bounds for dimension {}",
-                        stop, shape[x]
-                    )));
-                }
-
+            AxisBound::In(start, stop, 1) => {
                 let start = Bound::Included(Number::from(*start));
                 let stop = Bound::Excluded(Number::from(*stop));
                 range.insert(x, b_table::ColumnRange::In((start, stop)));
             }
-            AxisBound::Of(indices) => {
+            bound => {
                 return Err(Error::Bounds(format!(
                     "sparse tensor does not support axis bound {:?}",
-                    indices
+                    bound
                 )));
             }
         }
