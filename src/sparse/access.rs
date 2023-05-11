@@ -623,70 +623,60 @@ where
     }
 
     fn source_bounds(&self, bounds: Bounds) -> Result<Bounds, Error> {
-        if bounds.0.len() > self.ndim() {
-            Err(Error::Bounds(format!(
-                "invalid bounds for {:?}: {:?}",
-                self, bounds.0
-            )))
-        } else {
-            let mut source_bounds = Vec::with_capacity(self.source.ndim());
+        let mut source_bounds = Vec::with_capacity(self.source.ndim());
+        let mut axis = 0;
 
-            let mut source_axis = 0;
-            let mut axis = 0;
-
-            while source_bounds.len() < bounds.0.len() {
-                match &self.bounds.0[source_axis] {
-                    AxisBound::At(i) => {
-                        source_bounds.push(AxisBound::At(*i));
+        for source_bound in self.bounds.0.iter() {
+            let source_bound = match source_bound {
+                AxisBound::At(i) => AxisBound::At(*i),
+                AxisBound::In(source_start, _stop, _step) => match &bounds.0[axis] {
+                    AxisBound::At(i) => AxisBound::At(source_start + i),
+                    AxisBound::In(start, stop, step) => {
+                        let (source_start, source_stop, source_step) = (
+                            source_start + start,
+                            source_start + stop,
+                            source_start * step,
+                        );
+                        AxisBound::In(source_start, source_stop, source_step)
                     }
-                    AxisBound::In(start, stop, 1) => {
-                        let source_bound = match &bounds.0[axis] {
-                            AxisBound::At(i) => {
-                                let i = start + i;
-                                if i < *stop {
-                                    Ok(AxisBound::At(i))
-                                } else {
-                                    Err(Error::Bounds(format!(
-                                        "index {} is out of bounds for axis {}",
-                                        i, axis
-                                    )))
-                                }
-                            }
-                            AxisBound::In(start, stop, 1) => {
-                                let (source_start, source_stop) = (start + start, stop + start);
-                                if source_stop <= *stop {
-                                    Ok(AxisBound::In(source_start, source_stop, 1))
-                                } else {
-                                    Err(Error::Bounds(format!(
-                                        "range [{}, {}) is out of bounds for axis {}",
-                                        source_start, source_stop, axis
-                                    )))
-                                }
-                            }
-                            bound => Err(Error::Bounds(format!(
-                                "invalid bound for axis {}: {:?}",
-                                axis, bound
-                            ))),
-                        }?;
-
-                        source_bounds.push(source_bound);
-                        axis += 1;
+                    AxisBound::Of(indices) => {
+                        let indices = indices.iter().copied().map(|i| source_start + i).collect();
+                        AxisBound::Of(indices)
                     }
-                    bound => {
-                        return Err(Error::Bounds(format!(
-                            "invalid bound for sparse tensor: {:?}",
-                            bound
-                        )))
-                    }
-                }
+                },
+                AxisBound::Of(source_indices) => match &bounds.0[axis] {
+                    AxisBound::At(i) => AxisBound::At(source_indices[*i as usize]),
+                    AxisBound::In(start, stop, step) => {
+                        let indices = source_indices[(*start as usize)..(*stop as usize)]
+                            .iter()
+                            .step_by(*step as usize)
+                            .copied()
+                            .collect();
 
-                source_axis += 1;
+                        AxisBound::Of(indices)
+                    }
+                    AxisBound::Of(indices) => {
+                        let indices = indices
+                            .iter()
+                            .copied()
+                            .map(|i| source_indices[i as usize])
+                            .collect();
+
+                        AxisBound::Of(indices)
+                    }
+                },
+            };
+
+            if !source_bound.is_index() {
+                axis += 1;
             }
 
-            source_bounds.extend(self.bounds.0.iter().skip(bounds.0.len()).cloned());
-
-            Ok(Bounds(source_bounds))
+            source_bounds.push(source_bound);
         }
+
+        source_bounds.extend(self.bounds.0.iter().skip(bounds.0.len()).cloned());
+
+        Ok(Bounds(source_bounds))
     }
 
     fn source_order(&self, order: Axes) -> Result<Axes, Error> {
