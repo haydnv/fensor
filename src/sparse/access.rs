@@ -11,9 +11,10 @@ use freqfs::DirLock;
 use futures::future::TryFutureExt;
 use futures::stream::{Stream, StreamExt, TryStreamExt};
 use ha_ndarray::*;
+use itertools::Itertools;
 use number_general::{DType, Number, NumberCollator, NumberType};
 use rayon::prelude::*;
-use safecast::{AsType, CastInto};
+use safecast::{as_type, AsType, CastInto};
 
 use crate::{
     strides_for, validate_bounds, validate_order, Axes, AxisBound, Bounds, Coord, Error, Shape,
@@ -57,20 +58,36 @@ pub trait SparseInstance: TensorInstance + fmt::Debug {
     }
 }
 
-#[derive(Clone)]
 pub enum SparseAccess<FE, T> {
     Table(SparseTable<FE, T>),
-    Broadcast(Box<SparseBroadcast<Self>>),
+    Broadcast(Box<SparseBroadcast<FE, T>>),
+    BroadcastAxis(Box<SparseBroadcastAxis<Self>>),
     Expand(Box<SparseExpand<Self>>),
     Reshape(Box<SparseReshape<Self>>),
     Slice(Box<SparseSlice<Self>>),
 }
+
+impl<FE, T> Clone for SparseAccess<FE, T> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Table(table) => Self::Table(table.clone()),
+            Self::Broadcast(broadcast) => Self::Broadcast(broadcast.clone()),
+            Self::BroadcastAxis(broadcast) => Self::BroadcastAxis(broadcast.clone()),
+            Self::Expand(expand) => Self::Expand(expand.clone()),
+            Self::Reshape(reshape) => Self::Reshape(reshape.clone()),
+            Self::Slice(slice) => Self::Slice(slice.clone()),
+        }
+    }
+}
+
+as_type!(SparseAccess<FE, T>, Table, SparseTable<FE, T>);
 
 macro_rules! array_dispatch {
     ($this:ident, $var:ident, $call:expr) => {
         match $this {
             Self::Table($var) => $call,
             Self::Broadcast($var) => $call,
+            Self::BroadcastAxis($var) => $call,
             Self::Expand($var) => $call,
             Self::Reshape($var) => $call,
             Self::Slice($var) => $call,
@@ -116,6 +133,13 @@ where
 
                 Ok(Box::pin(blocks))
             }
+            Self::BroadcastAxis(broadcast) => {
+                let blocks = broadcast.blocks(bounds, order).await?;
+                let blocks =
+                    blocks.map_ok(|(coords, values)| (Array::from(coords), Array::from(values)));
+
+                Ok(Box::pin(blocks))
+            }
             Self::Expand(expand) => {
                 let blocks = expand.blocks(bounds, order).await?;
                 let blocks =
@@ -142,6 +166,12 @@ where
 
     async fn elements(self, bounds: Bounds, order: Axes) -> Result<Elements<Self::DType>, Error> {
         array_dispatch!(self, this, this.elements(bounds, order).await)
+    }
+}
+
+impl<FE, T> From<SparseBroadcast<FE, T>> for SparseAccess<FE, T> {
+    fn from(accessor: SparseBroadcast<FE, T>) -> Self {
+        Self::Broadcast(Box::new(accessor))
     }
 }
 
@@ -231,15 +261,157 @@ impl<FE, T> fmt::Debug for SparseTable<FE, T> {
     }
 }
 
+pub struct SparseBroadcast<FE, T> {
+    shape: Shape,
+    inner: SparseAccess<FE, T>,
+}
+
+impl<FE, T> Clone for SparseBroadcast<FE, T> {
+    fn clone(&self) -> Self {
+        Self {
+            shape: self.shape.to_vec(),
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<FE: Send + Sync + 'static, T: CDatatype + DType> SparseBroadcast<FE, T> {
+    fn new<S: TensorInstance>(source: S, shape: Shape) -> Result<Self, Error>
+    where
+        SparseAccess<FE, T>: From<S>,
+    {
+        let source_shape = source.shape().to_vec();
+        let mut inner = source.into();
+
+        let axes = (0..source_shape.len()).into_iter().rev();
+        let dims = source_shape
+            .into_iter()
+            .rev()
+            .zip(shape.iter().rev().copied());
+
+        for (x, (dim, bdim)) in axes.zip(dims) {
+            if dim == bdim {
+                // no-op
+            } else if dim == 1 {
+                let broadcast_axis = SparseBroadcastAxis::new(inner, x, bdim)?;
+                inner = SparseAccess::BroadcastAxis(Box::new(broadcast_axis));
+            } else {
+                return Err(Error::Bounds(format!(
+                    "cannot broadcast {} into {} at axis {}",
+                    dim, bdim, x
+                )));
+            }
+        }
+
+        Ok(Self { shape, inner })
+    }
+}
+
+impl<FE: Send + Sync + 'static, T: CDatatype + DType> TensorInstance for SparseBroadcast<FE, T> {
+    fn dtype(&self) -> NumberType {
+        T::dtype()
+    }
+
+    fn shape(&self) -> &[u64] {
+        &self.shape
+    }
+}
+
+#[async_trait]
+impl<FE, T> SparseInstance for SparseBroadcast<FE, T>
+where
+    FE: AsType<Node> + Send + Sync + 'static,
+    T: CDatatype + DType,
+    Number: CastInto<T>,
+{
+    type CoordBlock = ArrayBase<Vec<u64>>;
+    type ValueBlock = ArrayBase<Vec<Self::DType>>;
+    type Blocks = stream::BlockCoords<Elements<Self::DType>, Self::DType>;
+    type DType = T;
+
+    async fn blocks(self, bounds: Bounds, order: Axes) -> Result<Self::Blocks, Error> {
+        let ndim = self.ndim();
+        let elements = self.elements(bounds, order).await?;
+        Ok(stream::BlockCoords::new(elements, ndim))
+    }
+
+    async fn elements(
+        self,
+        mut bounds: Bounds,
+        order: Axes,
+    ) -> Result<Elements<Self::DType>, Error> {
+        let ndim = self.ndim();
+        let offset = ndim - self.inner.ndim();
+
+        if offset == 0 {
+            return self.inner.elements(bounds, order).await;
+        }
+
+        debug_assert!(validate_bounds(&bounds, self.shape()).is_ok());
+        debug_assert!(validate_order(&order, ndim));
+
+        let mut inner_bounds = Vec::with_capacity(self.inner.ndim());
+        while bounds.0.len() > offset {
+            inner_bounds.push(bounds.0.pop().expect("bound"));
+        }
+
+        let inner_order = if order
+            .iter()
+            .take(offset)
+            .copied()
+            .enumerate()
+            .all(|(o, x)| x == o)
+        {
+            Ok(order.iter().skip(offset).cloned().collect::<Axes>())
+        } else {
+            Err(Error::Bounds(format!(
+                "an outer broadcast of a sparse tensor does not support permutation"
+            )))
+        }?;
+
+        let outer = bounds.0.into_iter().multi_cartesian_product();
+
+        let inner = self.inner;
+        let elements = futures::stream::iter(outer)
+            .then(move |outer_coord| {
+                let inner = inner.clone();
+                let inner_bounds = inner_bounds.to_vec();
+                let inner_order = inner_order.to_vec();
+
+                async move {
+                    let inner_elements = inner.elements(Bounds(inner_bounds), inner_order).await?;
+
+                    let elements = inner_elements.map_ok(move |(inner_coord, value)| {
+                        let mut coord = Vec::with_capacity(ndim);
+                        coord.extend_from_slice(&outer_coord);
+                        coord.extend(inner_coord);
+                        (coord, value)
+                    });
+
+                    Result::<_, Error>::Ok(elements)
+                }
+            })
+            .try_flatten();
+
+        Ok(Box::pin(elements))
+    }
+}
+
+impl<FE, T> fmt::Debug for SparseBroadcast<FE, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "broadcasted sparse tensor with shape {:?}", self.shape)
+    }
+}
+
 #[derive(Clone)]
-pub struct SparseBroadcast<S> {
+pub struct SparseBroadcastAxis<S> {
     source: S,
     axis: usize,
     dim: u64,
     shape: Shape,
 }
 
-impl<S: TensorInstance + fmt::Debug> SparseBroadcast<S> {
+impl<S: TensorInstance + fmt::Debug> SparseBroadcastAxis<S> {
     fn new(source: S, axis: usize, dim: u64) -> Result<Self, Error> {
         let shape = if axis < source.ndim() {
             let mut shape = source.shape().to_vec();
@@ -268,7 +440,7 @@ impl<S: TensorInstance + fmt::Debug> SparseBroadcast<S> {
     }
 }
 
-impl<S: TensorInstance> TensorInstance for SparseBroadcast<S> {
+impl<S: TensorInstance> TensorInstance for SparseBroadcastAxis<S> {
     fn dtype(&self) -> NumberType {
         self.source.dtype()
     }
@@ -279,7 +451,7 @@ impl<S: TensorInstance> TensorInstance for SparseBroadcast<S> {
 }
 
 #[async_trait]
-impl<S: SparseInstance> SparseInstance for SparseBroadcast<S> {
+impl<S: SparseInstance + Clone> SparseInstance for SparseBroadcastAxis<S> {
     type CoordBlock = ArrayBase<Vec<u64>>;
     type ValueBlock = ArrayBase<Vec<Self::DType>>;
     type Blocks = stream::BlockCoords<Elements<Self::DType>, Self::DType>;
@@ -291,12 +463,19 @@ impl<S: SparseInstance> SparseInstance for SparseBroadcast<S> {
         Ok(stream::BlockCoords::new(elements, ndim))
     }
 
-    async fn elements(self, bounds: Bounds, order: Axes) -> Result<Elements<Self::DType>, Error> {
+    async fn elements(
+        self,
+        bounds: Bounds,
+        mut order: Axes,
+    ) -> Result<Elements<Self::DType>, Error> {
         debug_assert!(validate_bounds(&bounds, self.shape()).is_ok());
         debug_assert!(validate_order(&order, self.ndim()));
 
-        let (source_bounds, dim) = if bounds.0.len() > self.axis {
-            let bdim = match &bounds.0[self.axis] {
+        let axis = self.axis;
+        let ndim = self.shape.len();
+
+        let (source_bounds, dim) = if bounds.0.len() > axis {
+            let bdim = match &bounds.0[axis] {
                 AxisBound::At(i) if *i < self.dim => Ok(1),
                 AxisBound::In(start, stop, 1) if stop > start => Ok(stop - start),
                 bound => Err(Error::Bounds(format!(
@@ -306,14 +485,34 @@ impl<S: SparseInstance> SparseInstance for SparseBroadcast<S> {
             }?;
 
             let mut source_bounds = bounds;
-            source_bounds.0[self.axis] = AxisBound::At(0);
+            source_bounds.0[axis] = AxisBound::At(0);
             (source_bounds, bdim)
         } else {
             (bounds, self.dim)
         };
 
+        let (source_order, inner_order) = if order
+            .iter()
+            .take(axis)
+            .copied()
+            .enumerate()
+            .all(|(o, x)| x == 0)
+        {
+            let mut inner_order = Axes::with_capacity(ndim - axis);
+
+            while order.len() > axis {
+                inner_order.push(order.pop().expect("axis"));
+            }
+
+            Ok((order, inner_order))
+        } else {
+            Err(Error::Bounds(format!(
+                "an outer broadcast of a sparse tensor does not support permutation"
+            )))
+        }?;
+
         if self.axis == self.ndim() - 1 {
-            let source_elements = self.source.elements(source_bounds, order).await?;
+            let source_elements = self.source.elements(source_bounds, source_order).await?;
 
             // TODO: write a range to a slice of a coordinate block instead
             let elements = source_elements
@@ -321,6 +520,7 @@ impl<S: SparseInstance> SparseInstance for SparseBroadcast<S> {
                     futures::stream::iter(0..dim).map(move |i| {
                         let mut coord = source_coord.to_vec();
                         *coord.last_mut().expect("x") = i;
+
                         Ok((coord, value))
                     })
                 })
@@ -328,17 +528,70 @@ impl<S: SparseInstance> SparseInstance for SparseBroadcast<S> {
 
             Ok(Box::pin(elements))
         } else {
-            let axes = (0..self.axis).into_iter().collect();
-            let _filled = self.source.filled_at(source_bounds, axes).await?;
+            let axes = (0..axis).into_iter().collect();
+            let inner_bounds = source_bounds
+                .0
+                .iter()
+                .skip(axis)
+                .cloned()
+                .collect::<Vec<_>>();
 
-            // TODO: for each filled prefix, slice the source tensor and repeat the slice dim times
+            let source = self.source;
+            let filled = source.clone().filled_at(source_bounds, axes).await?;
 
-            todo!()
+            let elements = filled
+                .map(move |result| {
+                    let outer_coord = result?;
+                    debug_assert_eq!(outer_coord.len(), axis);
+                    debug_assert_eq!(outer_coord.last(), Some(&0));
+
+                    let inner_bounds = inner_bounds.to_vec();
+                    let inner_order = inner_order.to_vec();
+
+                    let prefix = outer_coord
+                        .iter()
+                        .copied()
+                        .map(|i| AxisBound::At(i))
+                        .collect();
+
+                    let slice = SparseSlice::new(source.clone(), prefix)?;
+
+                    let elements = futures::stream::iter(0..dim)
+                        .then(move |i| {
+                            let outer_coord = outer_coord[..axis - 1].to_vec();
+                            let inner_bounds = Bounds(inner_bounds.to_vec());
+                            let inner_order = inner_order.to_vec();
+                            let slice = slice.clone();
+
+                            async move {
+                                let inner_elements =
+                                    slice.elements(inner_bounds, inner_order).await?;
+
+                                let elements =
+                                    inner_elements.map_ok(move |(inner_coord, value)| {
+                                        let mut coord = Coord::with_capacity(ndim);
+                                        coord.copy_from_slice(&outer_coord);
+                                        coord.push(i);
+                                        coord.extend(inner_coord);
+
+                                        (coord, value)
+                                    });
+
+                                Result::<_, Error>::Ok(elements)
+                            }
+                        })
+                        .try_flatten();
+
+                    Result::<_, Error>::Ok(elements)
+                })
+                .try_flatten();
+
+            Ok(Box::pin(elements))
         }
     }
 }
 
-impl<S: fmt::Debug> fmt::Debug for SparseBroadcast<S> {
+impl<S: fmt::Debug> fmt::Debug for SparseBroadcastAxis<S> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "broadcast of {:?} axis {}", self.source, self.axis)
     }
@@ -629,17 +882,27 @@ where
         for source_bound in self.bounds.0.iter() {
             let source_bound = match source_bound {
                 AxisBound::At(i) => AxisBound::At(*i),
-                AxisBound::In(source_start, _stop, _step) => match &bounds.0[axis] {
-                    AxisBound::At(i) => AxisBound::At(source_start + i),
+                AxisBound::In(source_start, source_stop, source_step) => match &bounds.0[axis] {
+                    AxisBound::At(i) => {
+                        debug_assert!(i <= source_stop);
+
+                        AxisBound::At(source_start + i)
+                    }
                     AxisBound::In(start, stop, step) => {
+                        debug_assert!(start <= source_stop);
+                        debug_assert!(stop <= source_stop);
+
                         let (source_start, source_stop, source_step) = (
                             source_start + start,
                             source_start + stop,
-                            source_start * step,
+                            source_step * step,
                         );
+
                         AxisBound::In(source_start, source_stop, source_step)
                     }
                     AxisBound::Of(indices) => {
+                        debug_assert!(indices.iter().all(|i| i <= source_stop));
+
                         let indices = indices.iter().copied().map(|i| source_start + i).collect();
                         AxisBound::Of(indices)
                     }
@@ -647,6 +910,9 @@ where
                 AxisBound::Of(source_indices) => match &bounds.0[axis] {
                     AxisBound::At(i) => AxisBound::At(source_indices[*i as usize]),
                     AxisBound::In(start, stop, step) => {
+                        debug_assert!(*start as usize <= source_indices.len());
+                        debug_assert!(*stop as usize <= source_indices.len());
+
                         let indices = source_indices[(*start as usize)..(*stop as usize)]
                             .iter()
                             .step_by(*step as usize)

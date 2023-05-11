@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, iter};
 
 use b_table::collate::{Collate, Collator, Overlap, OverlapsRange, OverlapsValue};
 use ha_ndarray::{Buffer, CDatatype};
@@ -21,6 +21,25 @@ const IDEAL_BLOCK_SIZE: usize = 24;
 
 #[cfg(not(debug_assertions))]
 const IDEAL_BLOCK_SIZE: usize = 65_536;
+
+#[derive(Clone)]
+pub enum AxisBoundIter {
+    At(iter::Once<u64>),
+    In(std::iter::StepBy<std::ops::Range<u64>>),
+    Of(std::vec::IntoIter<u64>),
+}
+
+impl Iterator for AxisBoundIter {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::At(iter) => iter.next(),
+            Self::In(iter) => iter.next(),
+            Self::Of(iter) => iter.next(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AxisBound {
@@ -112,6 +131,21 @@ impl OverlapsValue<u64, Collator<u64>> for AxisBound {
             }
             Self::Of(this) if this.is_empty() => Overlap::Narrow,
             Self::Of(this) => to_range(this).overlaps_value(value, collator),
+        }
+    }
+}
+
+impl IntoIterator for AxisBound {
+    type Item = u64;
+    type IntoIter = AxisBoundIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        match self {
+            Self::At(i) => AxisBoundIter::At(iter::once(i)),
+            Self::In(start, stop, step) => {
+                AxisBoundIter::In((start..stop).step_by(step as usize).into_iter())
+            }
+            Self::Of(indices) => AxisBoundIter::Of(indices.into_iter()),
         }
     }
 }
