@@ -1,12 +1,14 @@
 use std::{fmt, iter};
 
 use b_table::collate::{Collate, Collator, Overlap, OverlapsRange, OverlapsValue};
+use destream::de;
+use freqfs::FileLoad;
 use ha_ndarray::{Buffer, CDatatype};
-use number_general::{DType, NumberType};
-use safecast::AsType;
+use number_general::{DType, Number, NumberInstance, NumberType};
+use safecast::{AsType, CastInto};
 
-pub use dense::{DenseFile, DenseTensor};
-pub use sparse::{Node, SparseTable, SparseTensor};
+pub use dense::{DenseAccess, DenseFile, DenseSlice, DenseTensor};
+pub use sparse::{Node, SparseAccess, SparseSlice, SparseTable, SparseTensor};
 
 pub mod dense;
 pub mod sparse;
@@ -197,6 +199,7 @@ impl Bounds {
             .copied()
             .map(|dim| AxisBound::In(0, dim, 1))
             .collect();
+
         Self(bounds)
     }
 
@@ -315,7 +318,9 @@ impl<T: TensorInstance> TensorInstance for Box<T> {
 }
 
 pub trait TensorTransform: TensorInstance + Sized {
-    fn broadcast(self, shape: Shape) -> Result<Self, Error>;
+    type Broadcast: TensorInstance;
+
+    fn broadcast(self, shape: Shape) -> Result<Self::Broadcast, Error>;
 
     fn expand(self, axes: Axes) -> Result<Self, Error>;
 
@@ -326,9 +331,163 @@ pub trait TensorTransform: TensorInstance + Sized {
     fn transpose(self, axes: Axes) -> Result<Self, Error>;
 }
 
+pub enum Dense<FE, T> {
+    File(DenseTensor<DenseFile<FE, T>>),
+    Slice(DenseTensor<DenseSlice<DenseFile<FE, T>>>),
+    View(DenseTensor<DenseAccess<FE, T>>),
+}
+
+impl<FE, T> Clone for Dense<FE, T> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::File(file) => Self::File(file.clone()),
+            Self::Slice(slice) => Self::Slice(slice.clone()),
+            Self::View(view) => Self::View(view.clone()),
+        }
+    }
+}
+
+impl<FE: Send + Sync + 'static, T: CDatatype + DType> TensorInstance for Dense<FE, T> {
+    fn dtype(&self) -> NumberType {
+        match self {
+            Self::File(file) => file.dtype(),
+            Self::Slice(slice) => slice.dtype(),
+            Self::View(view) => view.dtype(),
+        }
+    }
+
+    fn shape(&self) -> &[u64] {
+        match self {
+            Self::File(file) => file.shape(),
+            Self::Slice(slice) => slice.shape(),
+            Self::View(view) => view.shape(),
+        }
+    }
+}
+
+impl<FE, T> TensorTransform for Dense<FE, T>
+where
+    FE: AsType<Buffer<T>> + FileLoad,
+    T: CDatatype + DType,
+    Buffer<T>: de::FromStream<Context = ()>,
+{
+    type Broadcast = Self;
+
+    fn broadcast(self, shape: Shape) -> Result<Self::Broadcast, Error> {
+        if shape == self.shape() {
+            return Ok(self);
+        }
+
+        match self {
+            Self::File(file) => file.broadcast(shape).map(Self::from),
+            Self::Slice(slice) => slice.broadcast(shape).map(Self::from),
+            Self::View(view) => view.broadcast(shape).map(Self::from),
+        }
+    }
+
+    fn expand(self, axes: Axes) -> Result<Self, Error> {
+        todo!()
+    }
+
+    fn reshape(self, shape: Shape) -> Result<Self, Error> {
+        todo!()
+    }
+
+    fn slice(self, bounds: Bounds) -> Result<Self, Error> {
+        todo!()
+    }
+
+    fn transpose(self, axes: Axes) -> Result<Self, Error> {
+        todo!()
+    }
+}
+
+impl<FE, T, A: Into<DenseAccess<FE, T>>> From<DenseTensor<A>> for Dense<FE, T> {
+    fn from(dense: DenseTensor<A>) -> Self {
+        Self::View(DenseTensor::from(dense.into_inner().into()))
+    }
+}
+
+pub enum Sparse<FE, T> {
+    Table(SparseTensor<FE, T, SparseTable<FE, T>>),
+    Slice(SparseTensor<FE, T, SparseSlice<SparseTable<FE, T>>>),
+    View(SparseTensor<FE, T, SparseAccess<FE, T>>),
+}
+
+impl<FE, T> Clone for Sparse<FE, T> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Table(table) => Self::Table(table.clone()),
+            Self::Slice(slice) => Self::Slice(slice.clone()),
+            Self::View(view) => Self::View(view.clone()),
+        }
+    }
+}
+
+impl<FE: Send + Sync + 'static, T: CDatatype + DType> TensorInstance for Sparse<FE, T> {
+    fn dtype(&self) -> NumberType {
+        match self {
+            Self::Table(table) => table.dtype(),
+            Self::Slice(slice) => slice.dtype(),
+            Self::View(view) => view.dtype(),
+        }
+    }
+
+    fn shape(&self) -> &[u64] {
+        match self {
+            Self::Table(table) => table.shape(),
+            Self::Slice(slice) => slice.shape(),
+            Self::View(view) => view.shape(),
+        }
+    }
+}
+
+impl<FE, T> TensorTransform for Sparse<FE, T>
+where
+    FE: AsType<Node> + Send + Sync + 'static,
+    T: CDatatype + DType,
+    Number: CastInto<T>,
+{
+    type Broadcast = Self;
+
+    fn broadcast(self, shape: Shape) -> Result<Self::Broadcast, Error> {
+        if shape == self.shape() {
+            return Ok(self);
+        }
+
+        match self {
+            Self::Table(table) => table.broadcast(shape).map(Self::from),
+            Self::Slice(table) => table.broadcast(shape).map(Self::from),
+            Self::View(table) => table.broadcast(shape).map(Self::from),
+        }
+    }
+
+    fn expand(self, axes: Axes) -> Result<Self, Error> {
+        todo!()
+    }
+
+    fn reshape(self, shape: Shape) -> Result<Self, Error> {
+        todo!()
+    }
+
+    fn slice(self, bounds: Bounds) -> Result<Self, Error> {
+        todo!()
+    }
+
+    fn transpose(self, axes: Axes) -> Result<Self, Error> {
+        todo!()
+    }
+}
+
+impl<FE, T, A: Into<SparseAccess<FE, T>>> From<SparseTensor<FE, T, A>> for Sparse<FE, T> {
+    fn from(sparse: SparseTensor<FE, T, A>) -> Self {
+        Self::View(SparseTensor::from(sparse.into_inner().into()))
+    }
+}
+
 pub enum Tensor<FE, T> {
-    Dense(DenseTensor<FE, T>),
-    Sparse(SparseTensor<FE, T>),
+    Dense(Dense<FE, T>),
+    Sparse(Sparse<FE, T>),
 }
 
 impl<FE, T> TensorInstance for Tensor<FE, T>
@@ -350,11 +509,18 @@ where
 
 impl<FE, T> TensorTransform for Tensor<FE, T>
 where
-    FE: AsType<Node> + AsType<Buffer<T>> + Send + Sync + 'static,
-    T: CDatatype + DType,
+    FE: AsType<Node> + AsType<Buffer<T>> + FileLoad,
+    T: CDatatype + DType + NumberInstance,
+    Buffer<T>: de::FromStream<Context = ()>,
+    Number: CastInto<T>,
 {
+    type Broadcast = Self;
+
     fn broadcast(self, shape: Shape) -> Result<Self, Error> {
-        todo!()
+        match self {
+            Self::Dense(dense) => dense.broadcast(shape).map(Self::Dense),
+            Self::Sparse(sparse) => sparse.broadcast(shape).map(Self::Sparse),
+        }
     }
 
     fn expand(self, axes: Axes) -> Result<Self, Error> {

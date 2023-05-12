@@ -1,8 +1,4 @@
-use destream::de;
-use freqfs::FileLoad;
-use ha_ndarray::{Buffer, CDatatype};
-use number_general::{DType, NumberInstance, NumberType};
-use safecast::AsType;
+use number_general::NumberType;
 
 use super::{Axes, Bounds, Error, Shape, TensorInstance, TensorTransform};
 
@@ -10,44 +6,36 @@ pub use access::{DenseAccess, DenseBroadcast, DenseFile, DenseInstance, DenseSli
 
 mod access;
 
-pub enum DenseTensor<FE, T> {
-    Base(DenseFile<FE, T>),
-    Slice(DenseSlice<DenseFile<FE, T>>),
-    View(DenseAccess<FE, T>),
+#[derive(Clone)]
+pub struct DenseTensor<A> {
+    accessor: A,
 }
 
-impl<FE, T> Clone for DenseTensor<FE, T> {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Base(base) => Self::Base(base.clone()),
-            Self::Slice(slice) => Self::Slice(slice.clone()),
-            Self::View(view) => Self::View(view.clone()),
-        }
+impl<A> DenseTensor<A> {
+    pub fn into_inner(self) -> A {
+        self.accessor
     }
 }
 
-impl<FE: Send + Sync + 'static, T: CDatatype + DType> TensorInstance for DenseTensor<FE, T> {
+impl<A: TensorInstance> TensorInstance for DenseTensor<A> {
     fn dtype(&self) -> NumberType {
-        T::dtype()
+        self.accessor.dtype()
     }
 
     fn shape(&self) -> &[u64] {
-        match self {
-            Self::Base(base) => base.shape(),
-            Self::Slice(slice) => slice.shape(),
-            Self::View(view) => view.shape(),
-        }
+        self.accessor.shape()
     }
 }
 
-impl<FE, T> TensorTransform for DenseTensor<FE, T>
+impl<A> TensorTransform for DenseTensor<A>
 where
-    FE: AsType<Buffer<T>> + FileLoad + Send + Sync + 'static,
-    T: CDatatype + DType + NumberInstance,
-    Buffer<T>: de::FromStream<Context = ()>,
+    A: DenseInstance,
 {
-    fn broadcast(self, shape: Shape) -> Result<Self, Error> {
-        todo!()
+    type Broadcast = DenseTensor<DenseBroadcast<A>>;
+
+    fn broadcast(self, shape: Shape) -> Result<DenseTensor<DenseBroadcast<A>>, Error> {
+        let accessor = DenseBroadcast::new(self.accessor, shape)?;
+        Ok(DenseTensor { accessor })
     }
 
     fn expand(self, axes: Axes) -> Result<Self, Error> {
@@ -64,5 +52,11 @@ where
 
     fn transpose(self, axes: Axes) -> Result<Self, Error> {
         todo!()
+    }
+}
+
+impl<A> From<A> for DenseTensor<A> {
+    fn from(accessor: A) -> Self {
+        Self { accessor }
     }
 }

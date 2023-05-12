@@ -14,7 +14,7 @@ use ha_ndarray::*;
 use itertools::Itertools;
 use number_general::{DType, Number, NumberCollator, NumberType};
 use rayon::prelude::*;
-use safecast::{as_type, AsType, CastInto};
+use safecast::{AsType, CastInto};
 
 use crate::{
     strides_for, validate_bounds, validate_order, Axes, AxisBound, Bounds, Coord, Error, Shape,
@@ -79,8 +79,6 @@ impl<FE, T> Clone for SparseAccess<FE, T> {
         }
     }
 }
-
-as_type!(SparseAccess<FE, T>, Table, SparseTable<FE, T>);
 
 macro_rules! array_dispatch {
     ($this:ident, $var:ident, $call:expr) => {
@@ -245,6 +243,12 @@ where
     }
 }
 
+impl<FE, T> From<SparseTable<FE, T>> for SparseAccess<FE, T> {
+    fn from(table: SparseTable<FE, T>) -> Self {
+        Self::Table(table)
+    }
+}
+
 impl<FE, T> fmt::Debug for SparseTable<FE, T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
@@ -270,9 +274,9 @@ impl<FE, T> Clone for SparseBroadcast<FE, T> {
 }
 
 impl<FE: Send + Sync + 'static, T: CDatatype + DType> SparseBroadcast<FE, T> {
-    fn new<S: TensorInstance>(source: S, shape: Shape) -> Result<Self, Error>
+    pub fn new<S>(source: S, shape: Shape) -> Result<Self, Error>
     where
-        SparseAccess<FE, T>: From<S>,
+        S: TensorInstance + Into<SparseAccess<FE, T>>,
     {
         let source_shape = source.shape().to_vec();
         let mut inner = source.into();

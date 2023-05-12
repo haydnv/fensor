@@ -52,6 +52,7 @@ pub enum DenseAccess<FE, T> {
     Broadcast(Box<DenseBroadcast<Self>>),
     Reshape(Box<DenseReshape<Self>>),
     Slice(Box<DenseSlice<Self>>),
+    Transpose(Box<DenseTranspose<Self>>),
 }
 
 impl<FE, T> Clone for DenseAccess<FE, T> {
@@ -61,6 +62,7 @@ impl<FE, T> Clone for DenseAccess<FE, T> {
             Self::Broadcast(broadcast) => Self::Broadcast(broadcast.clone()),
             Self::Reshape(reshape) => Self::Reshape(reshape.clone()),
             Self::Slice(slice) => Self::Slice(slice.clone()),
+            Self::Transpose(transpose) => Self::Transpose(transpose.clone()),
         }
     }
 }
@@ -72,6 +74,7 @@ macro_rules! array_dispatch {
             Self::Broadcast($var) => $call,
             Self::Reshape($var) => $call,
             Self::Slice($var) => $call,
+            Self::Transpose($var) => $call,
         }
     };
 }
@@ -94,10 +97,8 @@ where
 impl<FE, T> DenseInstance for DenseAccess<FE, T>
 where
     FE: FileLoad + AsType<Buffer<T>> + Send + Sync,
-    T: CDatatype + DType + NumberInstance,
+    T: CDatatype + DType,
     Buffer<T>: de::FromStream<Context = ()>,
-    Box<Self>: DenseInstance,
-    Self: Clone,
 {
     type Block = Array<T>;
     type DType = T;
@@ -124,6 +125,9 @@ where
                 Ok(Box::pin(reshape.into_blocks().await?.map_ok(Array::from)))
             }
             Self::Slice(slice) => Ok(Box::pin(slice.into_blocks().await?.map_ok(Array::from))),
+            Self::Transpose(transpose) => {
+                Ok(Box::pin(transpose.into_blocks().await?.map_ok(Array::from)))
+            }
         }
     }
 }
@@ -306,6 +310,12 @@ where
     }
 }
 
+impl<FE, T> From<DenseFile<FE, T>> for DenseAccess<FE, T> {
+    fn from(file: DenseFile<FE, T>) -> Self {
+        Self::File(file)
+    }
+}
+
 impl<FE, T> fmt::Debug for DenseFile<FE, T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "dense tensor with shape {:?}", self.shape)
@@ -415,6 +425,17 @@ where
     }
 }
 
+impl<FE, T, S: Into<DenseAccess<FE, T>>> From<DenseBroadcast<S>> for DenseAccess<FE, T> {
+    fn from(broadcast: DenseBroadcast<S>) -> Self {
+        Self::Broadcast(Box::new(DenseBroadcast {
+            source: broadcast.source.into(),
+            shape: broadcast.shape,
+            block_map: broadcast.block_map,
+            block_size: broadcast.block_size,
+        }))
+    }
+}
+
 impl<S: fmt::Debug> fmt::Debug for DenseBroadcast<S> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "broadcast of {:?} into {:?}", self.source, self.shape)
@@ -486,6 +507,15 @@ where
         });
 
         Ok(Box::pin(blocks))
+    }
+}
+
+impl<FE, T, S: Into<DenseAccess<FE, T>>> From<DenseReshape<S>> for DenseAccess<FE, T> {
+    fn from(reshape: DenseReshape<S>) -> Self {
+        Self::Reshape(Box::new(DenseReshape {
+            source: reshape.source.into(),
+            shape: reshape.shape,
+        }))
     }
 }
 
@@ -755,6 +785,18 @@ where
     }
 }
 
+impl<FE, T, S: Into<DenseAccess<FE, T>>> From<DenseSlice<S>> for DenseAccess<FE, T> {
+    fn from(slice: DenseSlice<S>) -> Self {
+        Self::Slice(Box::new(DenseSlice {
+            source: slice.source.into(),
+            bounds: slice.bounds,
+            shape: slice.shape,
+            block_map: slice.block_map,
+            block_size: slice.block_size,
+        }))
+    }
+}
+
 impl<S: fmt::Debug> fmt::Debug for DenseSlice<S> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "slice {:?} from {:?}", self.bounds, self.source)
@@ -877,6 +919,17 @@ where
             });
 
         Ok(Box::pin(blocks))
+    }
+}
+
+impl<FE, T, S: Into<DenseAccess<FE, T>>> From<DenseTranspose<S>> for DenseAccess<FE, T> {
+    fn from(transpose: DenseTranspose<S>) -> Self {
+        Self::Transpose(Box::new(DenseTranspose {
+            source: transpose.source.into(),
+            shape: transpose.shape,
+            permutation: transpose.permutation.into(),
+            block_map: transpose.block_map,
+        }))
     }
 }
 
