@@ -51,6 +51,14 @@ pub enum AxisBound {
 }
 
 impl AxisBound {
+    pub fn dim(&self) -> u64 {
+        match self {
+            Self::At(_) => 0,
+            Self::In(start, stop, step) => (stop - start) / step,
+            Self::Of(indices) => indices.len() as u64,
+        }
+    }
+
     pub fn is_index(&self) -> bool {
         if let Self::At(_) = self {
             true
@@ -189,7 +197,7 @@ impl TryFrom<AxisBound> for ha_ndarray::AxisBound {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Bounds(Vec<AxisBound>);
 
 impl Bounds {
@@ -319,22 +327,36 @@ impl<T: TensorInstance> TensorInstance for Box<T> {
 
 pub trait TensorTransform: TensorInstance + Sized {
     type Broadcast: TensorInstance;
+    type Expand: TensorInstance;
+    type Reshape: TensorInstance;
+    type Slice: TensorInstance;
+    type Transpose: TensorInstance;
 
     fn broadcast(self, shape: Shape) -> Result<Self::Broadcast, Error>;
 
-    fn expand(self, axes: Axes) -> Result<Self, Error>;
+    fn expand(self, axes: Axes) -> Result<Self::Expand, Error>;
 
-    fn reshape(self, shape: Shape) -> Result<Self, Error>;
+    fn reshape(self, shape: Shape) -> Result<Self::Reshape, Error>;
 
-    fn slice(self, bounds: Bounds) -> Result<Self, Error>;
+    fn slice(self, bounds: Bounds) -> Result<Self::Slice, Error>;
 
-    fn transpose(self, axes: Axes) -> Result<Self, Error>;
+    fn transpose(self, permutation: Option<Axes>) -> Result<Self::Transpose, Error>;
 }
 
 pub enum Dense<FE, T> {
     File(DenseTensor<DenseFile<FE, T>>),
     Slice(DenseTensor<DenseSlice<DenseFile<FE, T>>>),
     View(DenseTensor<DenseAccess<FE, T>>),
+}
+
+macro_rules! dense_dispatch {
+    ($this:ident, $var:ident, $call:expr) => {
+        match $this {
+            Self::File($var) => $call,
+            Self::Slice($var) => $call,
+            Self::View($var) => $call,
+        }
+    };
 }
 
 impl<FE, T> Clone for Dense<FE, T> {
@@ -349,19 +371,11 @@ impl<FE, T> Clone for Dense<FE, T> {
 
 impl<FE: Send + Sync + 'static, T: CDatatype + DType> TensorInstance for Dense<FE, T> {
     fn dtype(&self) -> NumberType {
-        match self {
-            Self::File(file) => file.dtype(),
-            Self::Slice(slice) => slice.dtype(),
-            Self::View(view) => view.dtype(),
-        }
+        dense_dispatch!(self, this, this.dtype())
     }
 
     fn shape(&self) -> &[u64] {
-        match self {
-            Self::File(file) => file.shape(),
-            Self::Slice(slice) => slice.shape(),
-            Self::View(view) => view.shape(),
-        }
+        dense_dispatch!(self, this, this.shape())
     }
 }
 
@@ -372,33 +386,62 @@ where
     Buffer<T>: de::FromStream<Context = ()>,
 {
     type Broadcast = Self;
+    type Expand = Self;
+    type Reshape = Self;
+    type Slice = Self;
+    type Transpose = Self;
 
     fn broadcast(self, shape: Shape) -> Result<Self::Broadcast, Error> {
         if shape == self.shape() {
-            return Ok(self);
-        }
-
-        match self {
-            Self::File(file) => file.broadcast(shape).map(Self::from),
-            Self::Slice(slice) => slice.broadcast(shape).map(Self::from),
-            Self::View(view) => view.broadcast(shape).map(Self::from),
+            Ok(self)
+        } else {
+            dense_dispatch!(self, this, this.broadcast(shape).map(Self::from))
         }
     }
 
     fn expand(self, axes: Axes) -> Result<Self, Error> {
-        todo!()
+        if axes.is_empty() {
+            Ok(self)
+        } else {
+            dense_dispatch!(self, this, this.expand(axes).map(Self::from))
+        }
     }
 
     fn reshape(self, shape: Shape) -> Result<Self, Error> {
-        todo!()
+        if shape == self.shape() {
+            Ok(self)
+        } else {
+            dense_dispatch!(self, this, this.reshape(shape).map(Self::from))
+        }
     }
 
     fn slice(self, bounds: Bounds) -> Result<Self, Error> {
-        todo!()
+        if bounds == Bounds::default()
+            || bounds
+                .0
+                .iter()
+                .zip(self.shape())
+                .all(|(bound, dim)| bound.dim() == *dim)
+        {
+            Ok(self)
+        } else {
+            dense_dispatch!(self, this, this.slice(bounds).map(Self::from))
+        }
     }
 
-    fn transpose(self, axes: Axes) -> Result<Self, Error> {
-        todo!()
+    fn transpose(self, permutation: Option<Axes>) -> Result<Self, Error> {
+        if let Some(axes) = &permutation {
+            if axes
+                .iter()
+                .copied()
+                .zip(0..self.ndim())
+                .all(|(o, x)| x == o)
+            {
+                return Ok(self);
+            }
+        }
+
+        dense_dispatch!(self, this, this.transpose(permutation).map(Self::from))
     }
 }
 
@@ -414,6 +457,16 @@ pub enum Sparse<FE, T> {
     View(SparseTensor<FE, T, SparseAccess<FE, T>>),
 }
 
+macro_rules! sparse_dispatch {
+    ($this:ident, $var:ident, $call:expr) => {
+        match $this {
+            Self::Table($var) => $call,
+            Self::Slice($var) => $call,
+            Self::View($var) => $call,
+        }
+    };
+}
+
 impl<FE, T> Clone for Sparse<FE, T> {
     fn clone(&self) -> Self {
         match self {
@@ -426,19 +479,11 @@ impl<FE, T> Clone for Sparse<FE, T> {
 
 impl<FE: Send + Sync + 'static, T: CDatatype + DType> TensorInstance for Sparse<FE, T> {
     fn dtype(&self) -> NumberType {
-        match self {
-            Self::Table(table) => table.dtype(),
-            Self::Slice(slice) => slice.dtype(),
-            Self::View(view) => view.dtype(),
-        }
+        sparse_dispatch!(self, this, this.dtype())
     }
 
     fn shape(&self) -> &[u64] {
-        match self {
-            Self::Table(table) => table.shape(),
-            Self::Slice(slice) => slice.shape(),
-            Self::View(view) => view.shape(),
-        }
+        sparse_dispatch!(self, this, this.shape())
     }
 }
 
@@ -449,33 +494,56 @@ where
     Number: CastInto<T>,
 {
     type Broadcast = Self;
+    type Expand = Self;
+    type Reshape = Self;
+    type Slice = Self;
+    type Transpose = Self;
 
     fn broadcast(self, shape: Shape) -> Result<Self::Broadcast, Error> {
         if shape == self.shape() {
-            return Ok(self);
-        }
-
-        match self {
-            Self::Table(table) => table.broadcast(shape).map(Self::from),
-            Self::Slice(table) => table.broadcast(shape).map(Self::from),
-            Self::View(table) => table.broadcast(shape).map(Self::from),
+            Ok(self)
+        } else {
+            sparse_dispatch!(self, this, this.broadcast(shape).map(Self::from))
         }
     }
 
     fn expand(self, axes: Axes) -> Result<Self, Error> {
-        todo!()
+        if axes.is_empty() {
+            Ok(self)
+        } else {
+            sparse_dispatch!(self, this, this.expand(axes).map(Self::from))
+        }
     }
 
     fn reshape(self, shape: Shape) -> Result<Self, Error> {
-        todo!()
+        if shape == self.shape() {
+            Ok(self)
+        } else {
+            sparse_dispatch!(self, this, this.reshape(shape).map(Self::from))
+        }
     }
 
     fn slice(self, bounds: Bounds) -> Result<Self, Error> {
-        todo!()
+        if bounds == Bounds::default() {
+            Ok(self)
+        } else {
+            sparse_dispatch!(self, this, this.slice(bounds).map(Self::from))
+        }
     }
 
-    fn transpose(self, axes: Axes) -> Result<Self, Error> {
-        todo!()
+    fn transpose(self, permutation: Option<Axes>) -> Result<Self::Transpose, Error> {
+        if let Some(axes) = &permutation {
+            if axes
+                .iter()
+                .copied()
+                .zip(0..self.ndim())
+                .all(|(o, x)| x == o)
+            {
+                return Ok(self);
+            }
+        }
+
+        sparse_dispatch!(self, this, this.transpose(permutation).map(Self::from))
     }
 }
 
@@ -515,6 +583,10 @@ where
     Number: CastInto<T>,
 {
     type Broadcast = Self;
+    type Expand = Self;
+    type Reshape = Self;
+    type Slice = Self;
+    type Transpose = Self;
 
     fn broadcast(self, shape: Shape) -> Result<Self, Error> {
         match self {
@@ -524,19 +596,31 @@ where
     }
 
     fn expand(self, axes: Axes) -> Result<Self, Error> {
-        todo!()
+        match self {
+            Self::Dense(dense) => dense.expand(axes).map(Self::Dense),
+            Self::Sparse(sparse) => sparse.expand(axes).map(Self::Sparse),
+        }
     }
 
     fn reshape(self, shape: Shape) -> Result<Self, Error> {
-        todo!()
+        match self {
+            Self::Dense(dense) => dense.reshape(shape).map(Self::Dense),
+            Self::Sparse(sparse) => sparse.reshape(shape).map(Self::Sparse),
+        }
     }
 
     fn slice(self, bounds: Bounds) -> Result<Self, Error> {
-        todo!()
+        match self {
+            Self::Dense(dense) => dense.slice(bounds).map(Self::Dense),
+            Self::Sparse(sparse) => sparse.slice(bounds).map(Self::Sparse),
+        }
     }
 
-    fn transpose(self, axes: Axes) -> Result<Self, Error> {
-        todo!()
+    fn transpose(self, permutation: Option<Axes>) -> Result<Self, Error> {
+        match self {
+            Self::Dense(dense) => dense.transpose(permutation).map(Self::Dense),
+            Self::Sparse(sparse) => sparse.transpose(permutation).map(Self::Sparse),
+        }
     }
 }
 
@@ -605,5 +689,21 @@ fn validate_shape(shape: &[u64]) -> Result<(), Error> {
         )))
     } else {
         Ok(())
+    }
+}
+
+#[inline]
+fn validate_transpose(permutation: Option<Axes>, shape: &[u64]) -> Result<Axes, Error> {
+    if let Some(axes) = permutation {
+        if axes.len() == shape.len() && (0..shape.len()).into_iter().all(|x| axes.contains(&x)) {
+            Ok(axes)
+        } else {
+            Err(Error::Bounds(format!(
+                "invalid permutation for shape {:?}: {:?}",
+                shape, axes
+            )))
+        }
+    } else {
+        Ok((0..shape.len()).into_iter().rev().collect())
     }
 }

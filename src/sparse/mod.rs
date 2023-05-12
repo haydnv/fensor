@@ -8,7 +8,7 @@ use safecast::AsType;
 
 use super::{Axes, Bounds, Coord, Error, Shape, TensorInstance, TensorTransform};
 
-pub use access::{SparseAccess, SparseBroadcast, SparseInstance, SparseSlice, SparseTable};
+pub use access::*;
 pub use schema::*;
 
 mod access;
@@ -62,8 +62,12 @@ where
     A: SparseInstance + Into<SparseAccess<FE, T>>,
 {
     type Broadcast = SparseTensor<FE, T, SparseBroadcast<FE, T>>;
+    type Expand = SparseTensor<FE, T, SparseExpand<A>>;
+    type Reshape = SparseTensor<FE, T, SparseReshape<A>>;
+    type Slice = SparseTensor<FE, T, SparseSlice<A>>;
+    type Transpose = SparseTensor<FE, T, SparseTranspose<A>>;
 
-    fn broadcast(self, shape: Shape) -> Result<SparseTensor<FE, T, SparseBroadcast<FE, T>>, Error> {
+    fn broadcast(self, shape: Shape) -> Result<Self::Broadcast, Error> {
         let accessor = SparseBroadcast::new(self.accessor, shape)?;
 
         Ok(SparseTensor {
@@ -72,20 +76,40 @@ where
         })
     }
 
-    fn expand(self, axes: Axes) -> Result<Self, Error> {
-        todo!()
+    fn expand(self, axes: Axes) -> Result<Self::Expand, Error> {
+        let accessor = SparseExpand::new(self.accessor, axes)?;
+
+        Ok(SparseTensor {
+            accessor,
+            phantom: PhantomData,
+        })
     }
 
-    fn reshape(self, shape: Shape) -> Result<Self, Error> {
-        todo!()
+    fn reshape(self, shape: Shape) -> Result<Self::Reshape, Error> {
+        let accessor = SparseReshape::new(self.accessor, shape)?;
+
+        Ok(SparseTensor {
+            accessor,
+            phantom: PhantomData,
+        })
     }
 
-    fn slice(self, bounds: Bounds) -> Result<Self, Error> {
-        todo!()
+    fn slice(self, bounds: Bounds) -> Result<Self::Slice, Error> {
+        let accessor = SparseSlice::new(self.accessor, bounds)?;
+
+        Ok(SparseTensor {
+            accessor,
+            phantom: PhantomData,
+        })
     }
 
-    fn transpose(self, axes: Axes) -> Result<Self, Error> {
-        todo!()
+    fn transpose(self, permutation: Option<Axes>) -> Result<Self::Transpose, Error> {
+        let accessor = SparseTranspose::new(self.accessor, permutation)?;
+
+        Ok(SparseTensor {
+            accessor,
+            phantom: PhantomData,
+        })
     }
 }
 

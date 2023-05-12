@@ -11,7 +11,8 @@ use number_general::{DType, NumberClass, NumberInstance, NumberType};
 use safecast::AsType;
 
 use crate::{
-    validate_shape, Axes, AxisBound, Bounds, Error, Shape, TensorInstance, IDEAL_BLOCK_SIZE,
+    validate_bounds, validate_shape, validate_transpose, Axes, AxisBound, Bounds, Error, Shape,
+    TensorInstance, IDEAL_BLOCK_SIZE,
 };
 
 type BlockShape = ha_ndarray::Shape;
@@ -448,6 +449,19 @@ pub struct DenseReshape<S> {
     shape: Shape,
 }
 
+impl<S: DenseInstance> DenseReshape<S> {
+    pub fn new(source: S, shape: Shape) -> Result<Self, Error> {
+        if shape.iter().product::<u64>() == source.size() {
+            Ok(Self { source, shape })
+        } else {
+            Err(Error::Bounds(format!(
+                "cannot reshape {:?} into {:?}",
+                source, shape
+            )))
+        }
+    }
+}
+
 impl<S: TensorInstance> TensorInstance for DenseReshape<S> {
     fn dtype(&self) -> NumberType {
         self.source.dtype()
@@ -535,7 +549,9 @@ pub struct DenseSlice<S> {
 }
 
 impl<S: DenseInstance> DenseSlice<S> {
-    fn new(source: S, bounds: Bounds) -> Result<Self, Error> {
+    pub fn new(source: S, bounds: Bounds) -> Result<Self, Error> {
+        validate_bounds(&bounds, source.shape())?;
+
         if bounds.0.len() > source.ndim() {
             return Err(Error::Bounds(format!(
                 "invalid bounds for {:?}: {:?}",
@@ -812,21 +828,8 @@ pub struct DenseTranspose<S> {
 }
 
 impl<S: DenseInstance> DenseTranspose<S> {
-    fn new(source: S, permutation: Option<Axes>) -> Result<Self, Error> {
-        let permutation = if let Some(axes) = permutation {
-            if axes.len() == source.ndim()
-                && (0..source.ndim()).into_iter().all(|x| axes.contains(&x))
-            {
-                Ok(axes)
-            } else {
-                Err(Error::Bounds(format!(
-                    "invalid permutation for {:?}: {:?}",
-                    source, axes
-                )))
-            }
-        } else {
-            Ok((0..source.ndim()).into_iter().rev().collect())
-        }?;
+    pub fn new(source: S, permutation: Option<Axes>) -> Result<Self, Error> {
+        let permutation = validate_transpose(permutation, source.shape())?;
 
         let shape = permutation
             .iter()

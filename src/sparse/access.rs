@@ -17,8 +17,8 @@ use rayon::prelude::*;
 use safecast::{AsType, CastInto};
 
 use crate::{
-    strides_for, validate_bounds, validate_order, Axes, AxisBound, Bounds, Coord, Error, Shape,
-    Strides, TensorInstance,
+    strides_for, validate_bounds, validate_order, validate_transpose, Axes, AxisBound, Bounds,
+    Coord, Error, Shape, Strides, TensorInstance,
 };
 
 use super::schema::{IndexSchema, Schema};
@@ -65,6 +65,7 @@ pub enum SparseAccess<FE, T> {
     Expand(Box<SparseExpand<Self>>),
     Reshape(Box<SparseReshape<Self>>),
     Slice(Box<SparseSlice<Self>>),
+    Transpose(Box<SparseTranspose<Self>>),
 }
 
 impl<FE, T> Clone for SparseAccess<FE, T> {
@@ -76,6 +77,7 @@ impl<FE, T> Clone for SparseAccess<FE, T> {
             Self::Expand(expand) => Self::Expand(expand.clone()),
             Self::Reshape(reshape) => Self::Reshape(reshape.clone()),
             Self::Slice(slice) => Self::Slice(slice.clone()),
+            Self::Transpose(transpose) => Self::Transpose(transpose.clone()),
         }
     }
 }
@@ -89,6 +91,7 @@ macro_rules! array_dispatch {
             Self::Expand($var) => $call,
             Self::Reshape($var) => $call,
             Self::Slice($var) => $call,
+            Self::Transpose($var) => $call,
         }
     };
 }
@@ -154,6 +157,13 @@ where
             }
             Self::Slice(slice) => {
                 let blocks = slice.blocks(bounds, order).await?;
+                let blocks =
+                    blocks.map_ok(|(coords, values)| (Array::from(coords), Array::from(values)));
+
+                Ok(Box::pin(blocks))
+            }
+            Self::Transpose(transpose) => {
+                let blocks = transpose.blocks(bounds, order).await?;
                 let blocks =
                     blocks.map_ok(|(coords, values)| (Array::from(coords), Array::from(values)));
 
@@ -500,7 +510,7 @@ impl<S: SparseInstance + Clone> SparseInstance for SparseBroadcastAxis<S> {
             .take(axis)
             .copied()
             .enumerate()
-            .all(|(o, x)| x == 0)
+            .all(|(o, x)| x == o)
         {
             let mut inner_order = Axes::with_capacity(ndim - axis);
 
@@ -620,7 +630,7 @@ pub struct SparseExpand<S> {
 }
 
 impl<S: TensorInstance + fmt::Debug> SparseExpand<S> {
-    fn new(source: S, mut axes: Axes) -> Result<Self, Error> {
+    pub fn new(source: S, mut axes: Axes) -> Result<Self, Error> {
         axes.sort();
 
         let mut shape = source.shape().to_vec();
@@ -727,17 +737,24 @@ pub struct SparseReshape<S> {
     strides: Strides,
 }
 
-impl<S: TensorInstance> SparseReshape<S> {
-    fn new(source: S, shape: Shape) -> Self {
+impl<S: SparseInstance> SparseReshape<S> {
+    pub fn new(source: S, shape: Shape) -> Result<Self, Error> {
+        if source.shape().iter().product::<u64>() != shape.iter().product::<u64>() {
+            return Err(Error::Bounds(format!(
+                "cannot reshape {:?} into {:?}",
+                source, shape
+            )));
+        }
+
         let source_strides = strides_for(source.shape(), source.ndim());
         let strides = strides_for(&shape, shape.len());
 
-        Self {
+        Ok(Self {
             source,
             source_strides,
             shape,
             strides,
-        }
+        })
     }
 }
 
@@ -878,7 +895,7 @@ impl<S> SparseSlice<S>
 where
     S: TensorInstance + fmt::Debug,
 {
-    fn new(source: S, bounds: Bounds) -> Result<Self, Error> {
+    pub fn new(source: S, bounds: Bounds) -> Result<Self, Error> {
         if bounds.0.len() > source.ndim() {
             return Err(Error::Bounds(format!(
                 "invalid slice bounds for {:?}: {:?}",
@@ -1074,6 +1091,24 @@ pub struct SparseTranspose<S> {
     shape: Shape,
 }
 
+impl<S: SparseInstance> SparseTranspose<S> {
+    pub fn new(source: S, permutation: Option<Axes>) -> Result<Self, Error> {
+        let permutation = validate_transpose(permutation, source.shape())?;
+
+        let shape = permutation
+            .iter()
+            .copied()
+            .map(|x| source.shape()[x])
+            .collect();
+
+        Ok(Self {
+            source,
+            permutation,
+            shape,
+        })
+    }
+}
+
 impl<S> TensorInstance for SparseTranspose<S>
 where
     S: TensorInstance,
@@ -1151,6 +1186,16 @@ where
             .try_flatten();
 
         Ok(Box::pin(elements))
+    }
+}
+
+impl<FE, T, S: Into<SparseAccess<FE, T>>> From<SparseTranspose<S>> for SparseAccess<FE, T> {
+    fn from(transpose: SparseTranspose<S>) -> Self {
+        Self::Transpose(Box::new(SparseTranspose {
+            source: transpose.source.into(),
+            permutation: transpose.permutation,
+            shape: transpose.shape,
+        }))
     }
 }
 

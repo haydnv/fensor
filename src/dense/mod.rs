@@ -2,7 +2,7 @@ use number_general::NumberType;
 
 use super::{Axes, Bounds, Error, Shape, TensorInstance, TensorTransform};
 
-pub use access::{DenseAccess, DenseBroadcast, DenseFile, DenseInstance, DenseSlice};
+pub use access::*;
 
 mod access;
 
@@ -32,26 +32,37 @@ where
     A: DenseInstance,
 {
     type Broadcast = DenseTensor<DenseBroadcast<A>>;
+    type Expand = DenseTensor<DenseReshape<A>>;
+    type Reshape = DenseTensor<DenseReshape<A>>;
+    type Slice = DenseTensor<DenseSlice<A>>;
+    type Transpose = DenseTensor<DenseTranspose<A>>;
 
-    fn broadcast(self, shape: Shape) -> Result<DenseTensor<DenseBroadcast<A>>, Error> {
-        let accessor = DenseBroadcast::new(self.accessor, shape)?;
-        Ok(DenseTensor { accessor })
+    fn broadcast(self, shape: Shape) -> Result<Self::Broadcast, Error> {
+        DenseBroadcast::new(self.accessor, shape).map(DenseTensor::from)
     }
 
-    fn expand(self, axes: Axes) -> Result<Self, Error> {
-        todo!()
+    fn expand(self, mut axes: Axes) -> Result<Self::Expand, Error> {
+        let mut shape = self.shape().to_vec();
+
+        axes.sort();
+
+        for x in axes.into_iter().rev() {
+            shape.insert(x, 1);
+        }
+
+        DenseReshape::new(self.accessor, shape).map(DenseTensor::from)
     }
 
-    fn reshape(self, shape: Shape) -> Result<Self, Error> {
-        todo!()
+    fn reshape(self, shape: Shape) -> Result<Self::Reshape, Error> {
+        DenseReshape::new(self.accessor, shape).map(DenseTensor::from)
     }
 
-    fn slice(self, bounds: Bounds) -> Result<Self, Error> {
-        todo!()
+    fn slice(self, bounds: Bounds) -> Result<Self::Slice, Error> {
+        DenseSlice::new(self.accessor, bounds).map(DenseTensor::from)
     }
 
-    fn transpose(self, axes: Axes) -> Result<Self, Error> {
-        todo!()
+    fn transpose(self, permutation: Option<Axes>) -> Result<Self::Transpose, Error> {
+        DenseTranspose::new(self.accessor, permutation).map(DenseTensor::from)
     }
 }
 
