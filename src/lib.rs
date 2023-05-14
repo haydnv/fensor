@@ -2,10 +2,11 @@ use std::fmt;
 
 use destream::de;
 use freqfs::FileLoad;
-use ha_ndarray::{Buffer, CDatatype};
+use ha_ndarray::Buffer;
 use number_general::{DType, Number, NumberInstance, NumberType};
 use safecast::{AsType, CastInto};
 
+pub use ha_ndarray::CDatatype;
 pub use dense::{DenseAccess, DenseFile, DenseSlice, DenseTensor};
 pub use shape::{AxisRange, Range, Shape};
 pub use sparse::{Node, SparseAccess, SparseSlice, SparseTable, SparseTensor};
