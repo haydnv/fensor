@@ -15,6 +15,7 @@ categories = ["data-structures", "hardware-support", "mathematics"]
 opencl = ["ha-ndarray/opencl"]
 
 [dependencies]
+async-hash = { path = "../async-hash" }
 async-trait = "0.1"
 b-table = { path = "../b-table", features = ["stream"] }
 destream = { path = "../destream" }

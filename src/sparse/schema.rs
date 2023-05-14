@@ -93,7 +93,7 @@ impl Schema {
         }
     }
 
-    pub fn shape(&self) -> &[u64] {
+    pub fn shape(&self) -> &Shape {
         &self.shape
     }
 }

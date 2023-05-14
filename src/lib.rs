@@ -1,6 +1,5 @@
-use std::{fmt, iter};
+use std::fmt;
 
-use b_table::collate::{Collate, Collator, Overlap, OverlapsRange, OverlapsValue};
 use destream::de;
 use freqfs::FileLoad;
 use ha_ndarray::{Buffer, CDatatype};
@@ -8,14 +7,16 @@ use number_general::{DType, Number, NumberInstance, NumberType};
 use safecast::{AsType, CastInto};
 
 pub use dense::{DenseAccess, DenseFile, DenseSlice, DenseTensor};
+pub use shape::{AxisRange, Range, Shape};
 pub use sparse::{Node, SparseAccess, SparseSlice, SparseTable, SparseTensor};
 
 pub mod dense;
 pub mod sparse;
 
+mod shape;
+
 pub type Axes = Vec<usize>;
 pub type Coord = Vec<u64>;
-pub type Shape = Vec<u64>;
 pub type Strides = Vec<u64>;
 
 #[cfg(debug_assertions)]
@@ -23,250 +24,6 @@ const IDEAL_BLOCK_SIZE: usize = 24;
 
 #[cfg(not(debug_assertions))]
 const IDEAL_BLOCK_SIZE: usize = 65_536;
-
-#[derive(Clone)]
-pub enum AxisBoundIter {
-    At(iter::Once<u64>),
-    In(std::iter::StepBy<std::ops::Range<u64>>),
-    Of(std::vec::IntoIter<u64>),
-}
-
-impl Iterator for AxisBoundIter {
-    type Item = u64;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::At(iter) => iter.next(),
-            Self::In(iter) => iter.next(),
-            Self::Of(iter) => iter.next(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AxisBound {
-    At(u64),
-    In(u64, u64, u64),
-    Of(Vec<u64>),
-}
-
-impl AxisBound {
-    pub fn dim(&self) -> u64 {
-        match self {
-            Self::At(_) => 0,
-            Self::In(start, stop, step) => (stop - start) / step,
-            Self::Of(indices) => indices.len() as u64,
-        }
-    }
-
-    pub fn is_index(&self) -> bool {
-        if let Self::At(_) = self {
-            true
-        } else {
-            false
-        }
-    }
-}
-
-impl OverlapsRange<AxisBound, Collator<u64>> for AxisBound {
-    fn overlaps(&self, other: &AxisBound, collator: &Collator<u64>) -> Overlap {
-        #[inline]
-        fn invert(overlap: Overlap) -> Overlap {
-            match overlap {
-                Overlap::Less => Overlap::Greater,
-                Overlap::Greater => Overlap::Less,
-
-                Overlap::WideLess => Overlap::Narrow,
-                Overlap::Wide => Overlap::Narrow,
-                Overlap::WideGreater => Overlap::Narrow,
-
-                Overlap::Equal => Overlap::Equal,
-
-                overlap => unreachable!("range overlaps index: {:?}", overlap),
-            }
-        }
-
-        if self == other {
-            return Overlap::Equal;
-        }
-
-        match self {
-            Self::At(this) => match other {
-                Self::At(that) => this.cmp(that).into(),
-                Self::In(start, stop, _step) => {
-                    let that = *start..*stop;
-                    invert(that.overlaps_value(this, collator))
-                }
-                Self::Of(that) if that.is_empty() => Overlap::Wide,
-                Self::Of(that) => invert(to_range(that).overlaps_value(this, collator)),
-            },
-            Self::In(start, stop, _step) => {
-                let this = *start..*stop;
-
-                match other {
-                    Self::At(that) => this.overlaps_value(that, collator),
-                    Self::In(start, stop, _step) => {
-                        let that = *start..*stop;
-                        this.overlaps(&that, collator)
-                    }
-                    Self::Of(that) if that.is_empty() => Overlap::Wide,
-                    Self::Of(that) => this.overlaps(&to_range(that), collator),
-                }
-            }
-            Self::Of(this) if this.is_empty() => Overlap::Narrow,
-            Self::Of(this) => {
-                let this = to_range(this);
-
-                match other {
-                    Self::At(that) => this.overlaps_value(that, collator),
-                    Self::In(start, stop, _step) => {
-                        let that = *start..*stop;
-                        this.overlaps(&that, collator)
-                    }
-                    Self::Of(that) if that.is_empty() => Overlap::Wide,
-                    Self::Of(that) => this.overlaps(&to_range(that), collator),
-                }
-            }
-        }
-    }
-}
-
-impl OverlapsValue<u64, Collator<u64>> for AxisBound {
-    fn overlaps_value(&self, value: &u64, collator: &Collator<u64>) -> Overlap {
-        match self {
-            Self::At(this) => collator.cmp(this, value).into(),
-            Self::In(start, stop, _step) => {
-                let this = *start..*stop;
-                this.overlaps_value(value, collator)
-            }
-            Self::Of(this) if this.is_empty() => Overlap::Narrow,
-            Self::Of(this) => to_range(this).overlaps_value(value, collator),
-        }
-    }
-}
-
-impl IntoIterator for AxisBound {
-    type Item = u64;
-    type IntoIter = AxisBoundIter;
-
-    fn into_iter(self) -> Self::IntoIter {
-        match self {
-            Self::At(i) => AxisBoundIter::At(iter::once(i)),
-            Self::In(start, stop, step) => {
-                AxisBoundIter::In((start..stop).step_by(step as usize).into_iter())
-            }
-            Self::Of(indices) => AxisBoundIter::Of(indices.into_iter()),
-        }
-    }
-}
-
-#[inline]
-fn to_range(indices: &[u64]) -> std::ops::Range<u64> {
-    debug_assert!(!indices.is_empty());
-    let start = *indices.iter().fold(&u64::MAX, Ord::min);
-    let stop = *indices.iter().fold(&0, Ord::max);
-    start..stop
-}
-
-impl TryFrom<AxisBound> for ha_ndarray::AxisBound {
-    type Error = Error;
-
-    fn try_from(bound: AxisBound) -> Result<Self, Self::Error> {
-        match bound {
-            AxisBound::At(i) => i
-                .try_into()
-                .map(ha_ndarray::AxisBound::At)
-                .map_err(Error::Index),
-
-            AxisBound::In(start, stop, step) => {
-                let start = start.try_into().map_err(Error::Index)?;
-                let stop = stop.try_into().map_err(Error::Index)?;
-                let step = step.try_into().map_err(Error::Index)?;
-                Ok(ha_ndarray::AxisBound::In(start, stop, step))
-            }
-
-            AxisBound::Of(indices) => {
-                let indices = indices
-                    .into_iter()
-                    .map(|i| i.try_into().map_err(Error::Index))
-                    .collect::<Result<Vec<usize>, Error>>()?;
-
-                Ok(ha_ndarray::AxisBound::Of(indices))
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Bounds(Vec<AxisBound>);
-
-impl Bounds {
-    fn all(shape: &[u64]) -> Self {
-        let bounds = shape
-            .iter()
-            .copied()
-            .map(|dim| AxisBound::In(0, dim, 1))
-            .collect();
-
-        Self(bounds)
-    }
-
-    fn normalize(mut self, shape: &[u64]) -> Self {
-        for dim in shape.iter().skip(self.0.len()).copied() {
-            self.0.push(AxisBound::In(0, dim, 1))
-        }
-
-        self
-    }
-}
-
-impl OverlapsRange<Bounds, Collator<u64>> for Bounds {
-    fn overlaps(&self, other: &Bounds, collator: &Collator<u64>) -> Overlap {
-        match (self.0.is_empty(), other.0.is_empty()) {
-            (true, true) => return Overlap::Equal,
-            (true, false) => return Overlap::Greater,
-            (false, true) => return Overlap::Narrow,
-            (false, false) => {}
-        }
-
-        let mut overlap = Overlap::Equal;
-        for (this, that) in self.0.iter().zip(&other.0) {
-            match this.overlaps(that, collator) {
-                Overlap::Less => return Overlap::Less,
-                Overlap::Greater => return Overlap::Greater,
-                axis_overlap => overlap = overlap.then(axis_overlap),
-            }
-        }
-
-        overlap
-    }
-}
-
-impl OverlapsValue<Coord, Collator<u64>> for Bounds {
-    fn overlaps_value(&self, value: &Coord, collator: &Collator<u64>) -> Overlap {
-        let mut overlap = if self.0.len() == value.len() {
-            Overlap::Equal
-        } else {
-            Overlap::Wide
-        };
-
-        for (axis_bound, i) in self.0.iter().zip(value) {
-            match axis_bound.overlaps_value(i, collator) {
-                Overlap::Less => return Overlap::Less,
-                Overlap::Greater => return Overlap::Greater,
-                axis_overlap => overlap = overlap.then(axis_overlap),
-            }
-        }
-
-        overlap
-    }
-}
-
-impl FromIterator<AxisBound> for Bounds {
-    fn from_iter<I: IntoIterator<Item = AxisBound>>(iter: I) -> Self {
-        Self(iter.into_iter().collect())
-    }
-}
 
 #[derive(Debug)]
 pub enum Error {
@@ -308,7 +65,7 @@ pub trait TensorInstance: Send + Sync + 'static {
         self.shape().len()
     }
 
-    fn shape(&self) -> &[u64];
+    fn shape(&self) -> &Shape;
 
     fn size(&self) -> u64 {
         self.shape().iter().product()
@@ -320,7 +77,7 @@ impl<T: TensorInstance> TensorInstance for Box<T> {
         (**self).dtype()
     }
 
-    fn shape(&self) -> &[u64] {
+    fn shape(&self) -> &Shape {
         (**self).shape()
     }
 }
@@ -338,7 +95,7 @@ pub trait TensorTransform: TensorInstance + Sized {
 
     fn reshape(self, shape: Shape) -> Result<Self::Reshape, Error>;
 
-    fn slice(self, bounds: Bounds) -> Result<Self::Slice, Error>;
+    fn slice(self, range: Range) -> Result<Self::Slice, Error>;
 
     fn transpose(self, permutation: Option<Axes>) -> Result<Self::Transpose, Error>;
 }
@@ -374,7 +131,7 @@ impl<FE: Send + Sync + 'static, T: CDatatype + DType> TensorInstance for Dense<F
         dense_dispatch!(self, this, this.dtype())
     }
 
-    fn shape(&self) -> &[u64] {
+    fn shape(&self) -> &Shape {
         dense_dispatch!(self, this, this.shape())
     }
 }
@@ -392,7 +149,7 @@ where
     type Transpose = Self;
 
     fn broadcast(self, shape: Shape) -> Result<Self::Broadcast, Error> {
-        if shape == self.shape() {
+        if &shape == self.shape() {
             Ok(self)
         } else {
             dense_dispatch!(self, this, this.broadcast(shape).map(Self::from))
@@ -408,24 +165,23 @@ where
     }
 
     fn reshape(self, shape: Shape) -> Result<Self, Error> {
-        if shape == self.shape() {
+        if &shape == self.shape() {
             Ok(self)
         } else {
             dense_dispatch!(self, this, this.reshape(shape).map(Self::from))
         }
     }
 
-    fn slice(self, bounds: Bounds) -> Result<Self, Error> {
-        if bounds == Bounds::default()
-            || bounds
-                .0
+    fn slice(self, range: Range) -> Result<Self, Error> {
+        if range == Range::default()
+            || range
                 .iter()
-                .zip(self.shape())
-                .all(|(bound, dim)| bound.dim() == *dim)
+                .zip(self.shape().iter().copied())
+                .all(|(bound, dim)| bound.dim() == dim)
         {
             Ok(self)
         } else {
-            dense_dispatch!(self, this, this.slice(bounds).map(Self::from))
+            dense_dispatch!(self, this, this.slice(range).map(Self::from))
         }
     }
 
@@ -482,7 +238,7 @@ impl<FE: Send + Sync + 'static, T: CDatatype + DType> TensorInstance for Sparse<
         sparse_dispatch!(self, this, this.dtype())
     }
 
-    fn shape(&self) -> &[u64] {
+    fn shape(&self) -> &Shape {
         sparse_dispatch!(self, this, this.shape())
     }
 }
@@ -500,7 +256,7 @@ where
     type Transpose = Self;
 
     fn broadcast(self, shape: Shape) -> Result<Self::Broadcast, Error> {
-        if shape == self.shape() {
+        if &shape == self.shape() {
             Ok(self)
         } else {
             sparse_dispatch!(self, this, this.broadcast(shape).map(Self::from))
@@ -516,18 +272,18 @@ where
     }
 
     fn reshape(self, shape: Shape) -> Result<Self, Error> {
-        if shape == self.shape() {
+        if &shape == self.shape() {
             Ok(self)
         } else {
             sparse_dispatch!(self, this, this.reshape(shape).map(Self::from))
         }
     }
 
-    fn slice(self, bounds: Bounds) -> Result<Self, Error> {
-        if bounds == Bounds::default() {
+    fn slice(self, range: Range) -> Result<Self, Error> {
+        if range == Range::default() {
             Ok(self)
         } else {
-            sparse_dispatch!(self, this, this.slice(bounds).map(Self::from))
+            sparse_dispatch!(self, this, this.slice(range).map(Self::from))
         }
     }
 
@@ -567,7 +323,7 @@ where
         T::dtype()
     }
 
-    fn shape(&self) -> &[u64] {
+    fn shape(&self) -> &Shape {
         match self {
             Self::Dense(dense) => dense.shape(),
             Self::Sparse(sparse) => sparse.shape(),
@@ -609,10 +365,10 @@ where
         }
     }
 
-    fn slice(self, bounds: Bounds) -> Result<Self, Error> {
+    fn slice(self, range: Range) -> Result<Self, Error> {
         match self {
-            Self::Dense(dense) => dense.slice(bounds).map(Self::Dense),
-            Self::Sparse(sparse) => sparse.slice(bounds).map(Self::Sparse),
+            Self::Dense(dense) => dense.slice(range).map(Self::Dense),
+            Self::Sparse(sparse) => sparse.slice(range).map(Self::Sparse),
         }
     }
 
@@ -644,52 +400,6 @@ fn strides_for(shape: &[u64], ndim: usize) -> Strides {
 #[inline]
 fn validate_order(order: &[usize], ndim: usize) -> bool {
     order.len() == ndim && order.iter().all(|x| x < &ndim)
-}
-
-#[inline]
-fn validate_bound(bound: &AxisBound, dim: &u64) -> bool {
-    match bound {
-        AxisBound::At(i) => i < dim,
-        AxisBound::In(start, stop, _step) => {
-            if start > dim || stop > dim {
-                false
-            } else {
-                start < stop
-            }
-        }
-        AxisBound::Of(indices) => indices.iter().all(|i| i < dim),
-    }
-}
-
-#[inline]
-fn validate_bounds(bounds: &Bounds, shape: &[u64]) -> Result<(), Error> {
-    for (x, (bound, dim)) in bounds.0.iter().zip(shape).enumerate() {
-        if !validate_bound(bound, dim) {
-            return Err(Error::Bounds(format!(
-                "invalid bound for axis {} with dimension {}: {:?}",
-                x, dim, bound
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-#[inline]
-fn validate_shape(shape: &[u64]) -> Result<(), Error> {
-    if shape.is_empty()
-        || shape
-            .iter()
-            .copied()
-            .any(|dim| dim == 0 || dim > u32::MAX as u64)
-    {
-        Err(Error::Bounds(format!(
-            "invalid shape for dense tensor: {:?}",
-            shape
-        )))
-    } else {
-        Ok(())
-    }
 }
 
 #[inline]

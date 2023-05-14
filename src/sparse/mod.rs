@@ -6,7 +6,7 @@ use ha_ndarray::CDatatype;
 use number_general::{DType, Number, NumberType};
 use safecast::AsType;
 
-use super::{Axes, Bounds, Coord, Error, Shape, TensorInstance, TensorTransform};
+use super::{Axes, Coord, Error, Range, Shape, TensorInstance, TensorTransform};
 
 pub use access::*;
 pub use schema::*;
@@ -50,7 +50,7 @@ where
         T::dtype()
     }
 
-    fn shape(&self) -> &[u64] {
+    fn shape(&self) -> &Shape {
         self.accessor.shape()
     }
 }
@@ -94,8 +94,8 @@ where
         })
     }
 
-    fn slice(self, bounds: Bounds) -> Result<Self::Slice, Error> {
-        let accessor = SparseSlice::new(self.accessor, bounds)?;
+    fn slice(self, range: Range) -> Result<Self::Slice, Error> {
+        let accessor = SparseSlice::new(self.accessor, range)?;
 
         Ok(SparseTensor {
             accessor,

@@ -1,6 +1,6 @@
 use number_general::NumberType;
 
-use super::{Axes, Bounds, Error, Shape, TensorInstance, TensorTransform};
+use super::{Axes, Error, Range, Shape, TensorInstance, TensorTransform};
 
 pub use access::*;
 
@@ -22,7 +22,7 @@ impl<A: TensorInstance> TensorInstance for DenseTensor<A> {
         self.accessor.dtype()
     }
 
-    fn shape(&self) -> &[u64] {
+    fn shape(&self) -> &Shape {
         self.accessor.shape()
     }
 }
@@ -50,15 +50,15 @@ where
             shape.insert(x, 1);
         }
 
-        DenseReshape::new(self.accessor, shape).map(DenseTensor::from)
+        DenseReshape::new(self.accessor, shape.into()).map(DenseTensor::from)
     }
 
     fn reshape(self, shape: Shape) -> Result<Self::Reshape, Error> {
         DenseReshape::new(self.accessor, shape).map(DenseTensor::from)
     }
 
-    fn slice(self, bounds: Bounds) -> Result<Self::Slice, Error> {
-        DenseSlice::new(self.accessor, bounds).map(DenseTensor::from)
+    fn slice(self, range: Range) -> Result<Self::Slice, Error> {
+        DenseSlice::new(self.accessor, range).map(DenseTensor::from)
     }
 
     fn transpose(self, permutation: Option<Axes>) -> Result<Self::Transpose, Error> {
