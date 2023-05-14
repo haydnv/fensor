@@ -162,7 +162,103 @@ impl<FE, T> DenseFile<FE, T>
 where
     FE: FileLoad + AsType<Buffer<T>> + Send + Sync,
     T: CDatatype + DType + NumberInstance,
+    Buffer<T>: de::FromStream<Context = ()>,
 {
+    pub async fn load(dir: DirLock<FE>, shape: Shape) -> Result<Self, Error> {
+        let contents = dir.read().await;
+        let num_blocks = contents.len();
+
+        if num_blocks == 0 {
+            return Err(Error::IO(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("cannot load a dense tensor from an empty directory"),
+            )));
+        }
+
+        let mut size = 0u64;
+
+        let block_size = {
+            let block = contents
+                .get_file(&0)
+                .ok_or_else(|| Error::IO(io::Error::new(io::ErrorKind::NotFound, "block 0")))?;
+
+            let block = block.read().await?;
+            size += block.len() as u64;
+            block.len()
+        };
+
+        let block_axis = block_axis_for(&shape, block_size);
+        let block_shape = block_shape_for(block_axis, &shape, block_size);
+
+        for block_id in 1..(num_blocks - 1) {
+            let block = contents.get_file(&block_id).ok_or_else(|| {
+                Error::IO(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("block {}", block_id),
+                ))
+            })?;
+
+            let block = block.read().await?;
+            if block.len() == block_size {
+                size += block.len() as u64;
+            } else {
+                return Err(Error::Bounds(format!(
+                    "block {} has incorrect size {} (expected {})",
+                    block_id,
+                    block.len(),
+                    block_size
+                )));
+            }
+        }
+
+        {
+            let block_id = num_blocks - 1;
+            let block = contents.get_file(&block_id).ok_or_else(|| {
+                Error::IO(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("block {}", block_id),
+                ))
+            })?;
+
+            let block = block.read().await?;
+            size += block.len() as u64;
+        }
+
+        std::mem::drop(contents);
+
+        if size != shape.size() {
+            return Err(Error::Bounds(format!(
+                "tensor blocks have incorrect total length {} (expected {} for shape {:?})",
+                size,
+                shape.size(),
+                shape
+            )));
+        }
+
+        let mut block_map_shape = BlockShape::with_capacity(block_axis + 1);
+        block_map_shape.extend(
+            shape
+                .iter()
+                .take(block_axis)
+                .copied()
+                .map(|dim| dim as usize),
+        );
+        block_map_shape.push(shape[block_axis] as usize / block_shape[0]);
+
+        let block_map = ArrayBase::<Vec<_>>::new(
+            block_map_shape,
+            (0..num_blocks as u64).into_iter().collect(),
+        )?;
+
+        Ok(Self {
+            dir,
+            block_map,
+            block_size,
+            shape,
+            dtype: PhantomData,
+        })
+    }
+
     pub async fn constant(dir: DirLock<FE>, shape: Shape, value: T) -> Result<Self, Error> {
         shape.validate()?;
 
