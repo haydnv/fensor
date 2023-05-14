@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use b_table::TableLock;
+use b_table::{TableLock, TableWriteGuard};
 use freqfs::DirLock;
 use futures::future::TryFutureExt;
 use futures::stream::{Stream, StreamExt, TryStreamExt};
@@ -186,6 +186,16 @@ impl<FE, T> fmt::Debug for SparseAccess<FE, T> {
 pub struct SparseTable<FE, T> {
     table: TableLock<Schema, IndexSchema, NumberCollator, FE>,
     dtype: PhantomData<T>,
+}
+
+impl<FE: Send + Sync, T> SparseTable<FE, T> {
+    pub async fn write(self) -> SparseWriteGuard<FE, T> {
+        SparseWriteGuard {
+            table: self.table.write().await,
+            range: Range::default(),
+            dtype: self.dtype,
+        }
+    }
 }
 
 impl<FE, T> Clone for SparseTable<FE, T> {
@@ -999,6 +1009,16 @@ where
     }
 }
 
+impl<FE: Send + Sync, T> SparseSlice<SparseTable<FE, T>> {
+    pub async fn write(self) -> SparseWriteGuard<FE, T> {
+        SparseWriteGuard {
+            table: self.source.table.write().await,
+            range: self.range,
+            dtype: self.source.dtype,
+        }
+    }
+}
+
 impl<S> TensorInstance for SparseSlice<S>
 where
     S: TensorInstance,
@@ -1189,6 +1209,31 @@ impl<S: fmt::Debug> fmt::Debug for SparseTranspose<S> {
             "transpose of {:?} with permutation {:?}",
             self.source, self.permutation
         )
+    }
+}
+
+pub struct SparseWriteGuard<FE, T> {
+    table: TableWriteGuard<Schema, IndexSchema, NumberCollator, FE>,
+    range: Range,
+    dtype: PhantomData<T>,
+}
+
+impl<FE, T> SparseWriteGuard<FE, T>
+where
+    FE: AsType<Node> + Send + Sync + 'static,
+    T: CDatatype + DType + Into<Number>,
+{
+    pub async fn write_value(&mut self, coord: Coord, value: T) -> Result<(), Error> {
+        let coord = self.range.invert_coord(coord)?;
+        let coord = coord.into_iter().map(Number::from).collect();
+
+        if value == T::zero() {
+            self.table.delete(&coord).await?;
+        } else {
+            self.table.upsert(coord, vec![value.into()]).await?;
+        }
+
+        Ok(())
     }
 }
 
