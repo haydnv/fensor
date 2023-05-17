@@ -73,6 +73,7 @@ pub enum SparseAccess<FE, T> {
     Table(SparseTable<FE, T>),
     Broadcast(Box<SparseBroadcast<FE, T>>),
     BroadcastAxis(Box<SparseBroadcastAxis<Self>>),
+    Cow(Box<SparseCow<FE, T, Self>>),
     Expand(Box<SparseExpand<Self>>),
     Reshape(Box<SparseReshape<Self>>),
     Slice(Box<SparseSlice<Self>>),
@@ -85,6 +86,7 @@ impl<FE, T> Clone for SparseAccess<FE, T> {
             Self::Table(table) => Self::Table(table.clone()),
             Self::Broadcast(broadcast) => Self::Broadcast(broadcast.clone()),
             Self::BroadcastAxis(broadcast) => Self::BroadcastAxis(broadcast.clone()),
+            Self::Cow(cow) => Self::Cow(cow.clone()),
             Self::Expand(expand) => Self::Expand(expand.clone()),
             Self::Reshape(reshape) => Self::Reshape(reshape.clone()),
             Self::Slice(slice) => Self::Slice(slice.clone()),
@@ -99,6 +101,7 @@ macro_rules! array_dispatch {
             Self::Table($var) => $call,
             Self::Broadcast($var) => $call,
             Self::BroadcastAxis($var) => $call,
+            Self::Cow($var) => $call,
             Self::Expand($var) => $call,
             Self::Reshape($var) => $call,
             Self::Slice($var) => $call,
@@ -121,7 +124,7 @@ impl<FE: Send + Sync + 'static, T: CDatatype + DType> TensorInstance for SparseA
 impl<FE, T> SparseInstance for SparseAccess<FE, T>
 where
     FE: AsType<Node> + Send + Sync + 'static,
-    T: CDatatype + DType,
+    T: CDatatype + DType + NumberInstance,
     Number: CastInto<T>,
 {
     type CoordBlock = Array<u64>;
@@ -147,6 +150,13 @@ where
             }
             Self::BroadcastAxis(broadcast) => {
                 let blocks = broadcast.blocks(range, order).await?;
+                let blocks =
+                    blocks.map_ok(|(coords, values)| (Array::from(coords), Array::from(values)));
+
+                Ok(Box::pin(blocks))
+            }
+            Self::Cow(cow) => {
+                let blocks = cow.blocks(range, order).await?;
                 let blocks =
                     blocks.map_ok(|(coords, values)| (Array::from(coords), Array::from(values)));
 
@@ -308,7 +318,7 @@ pub struct SparseTableWriteGuard<'a, FE, T> {
 impl<'a, FE, T> SparseWriteGuard<T> for SparseTableWriteGuard<'a, FE, T>
 where
     FE: AsType<Node> + Send + Sync + 'static,
-    T: CDatatype + DType + Into<Number>,
+    T: CDatatype + DType + NumberInstance,
 {
     async fn write_value(&mut self, coord: Coord, value: T) -> Result<(), Error> {
         self.shape.validate_coord(&coord)?;
@@ -385,7 +395,7 @@ impl<FE: Send + Sync + 'static, T: CDatatype + DType> TensorInstance for SparseB
 impl<FE, T> SparseInstance for SparseBroadcast<FE, T>
 where
     FE: AsType<Node> + Send + Sync + 'static,
-    T: CDatatype + DType,
+    T: CDatatype + DType + NumberInstance,
     Number: CastInto<T>,
 {
     type CoordBlock = ArrayBase<Vec<u64>>;
@@ -667,11 +677,20 @@ impl<S: fmt::Debug> fmt::Debug for SparseBroadcastAxis<S> {
     }
 }
 
-#[derive(Clone)]
 pub struct SparseCow<FE, T, S> {
     source: S,
     filled: SparseTable<FE, T>,
     zeros: SparseTable<FE, T>,
+}
+
+impl<FE, T, S: Clone> Clone for SparseCow<FE, T, S> {
+    fn clone(&self) -> Self {
+        Self {
+            source: self.source.clone(),
+            filled: self.filled.clone(),
+            zeros: self.zeros.clone(),
+        }
+    }
 }
 
 impl<FE, T, S> SparseCow<FE, T, S> {
@@ -682,7 +701,7 @@ impl<FE, T, S> SparseCow<FE, T, S> {
 
 impl<FE, T, S> TensorInstance for SparseCow<FE, T, S>
 where
-    FE: AsType<Node> + Send + Sync + 'static,
+    FE: Send + Sync + 'static,
     T: CDatatype + DType,
     S: TensorInstance,
 {
@@ -792,13 +811,9 @@ where
     }
 }
 
-impl<FE, T, S: TensorInstance> fmt::Debug for SparseCow<FE, T, S> {
+impl<FE, T, S: fmt::Debug> fmt::Debug for SparseCow<FE, T, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "sparse copy-on-write tensor with shape {:?}",
-            self.source.shape()
-        )
+        write!(f, "sparse copy-on-write tensor based on {:?}", self.source)
     }
 }
 

@@ -246,7 +246,7 @@ impl<FE: Send + Sync + 'static, T: CDatatype + DType> TensorInstance for Sparse<
 impl<FE, T> TensorTransform for Sparse<FE, T>
 where
     FE: AsType<Node> + Send + Sync + 'static,
-    T: CDatatype + DType,
+    T: CDatatype + DType + NumberInstance,
     Number: CastInto<T>,
 {
     type Broadcast = Self;
