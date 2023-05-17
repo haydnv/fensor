@@ -12,7 +12,7 @@ use futures::stream::{Stream, StreamExt, TryStreamExt};
 use futures::try_join;
 use ha_ndarray::*;
 use itertools::Itertools;
-use number_general::{DType, Number, NumberCollator, NumberType};
+use number_general::{DType, Number, NumberCollator, NumberInstance, NumberType};
 use rayon::prelude::*;
 use safecast::{AsType, CastInto};
 
@@ -55,6 +55,18 @@ pub trait SparseInstance: TensorInstance + fmt::Debug {
             .map_ok(|elements| stream::FilledAt::new(elements, axes, ndim))
             .await
     }
+}
+
+#[async_trait]
+pub trait SparseWrite<'a>: SparseInstance {
+    type Guard: SparseWriteGuard<Self::DType>;
+
+    async fn write(&'a self) -> Self::Guard;
+}
+
+#[async_trait]
+pub trait SparseWriteGuard<T: CDatatype + DType>: Send + Sync {
+    async fn write_value(&mut self, coord: Coord, value: T) -> Result<(), Error>;
 }
 
 pub enum SparseAccess<FE, T> {
@@ -187,16 +199,6 @@ pub struct SparseTable<FE, T> {
     dtype: PhantomData<T>,
 }
 
-impl<FE: Send + Sync, T> SparseTable<FE, T> {
-    pub async fn write(self) -> SparseWriteGuard<FE, T> {
-        SparseWriteGuard {
-            table: self.table.write().await,
-            range: Range::default(),
-            dtype: self.dtype,
-        }
-    }
-}
-
 impl<FE, T> Clone for SparseTable<FE, T> {
     fn clone(&self) -> Self {
         Self {
@@ -262,6 +264,24 @@ where
     }
 }
 
+#[async_trait]
+impl<'a, FE, T> SparseWrite<'a> for SparseTable<FE, T>
+where
+    FE: AsType<Node> + Send + Sync + 'static,
+    T: CDatatype + DType + NumberInstance,
+    Number: CastInto<T>,
+{
+    type Guard = SparseTableWriteGuard<'a, FE, T>;
+
+    async fn write(&'a self) -> SparseTableWriteGuard<'a, FE, T> {
+        SparseTableWriteGuard {
+            shape: self.table.schema().shape(),
+            table: self.table.write().await,
+            dtype: self.dtype,
+        }
+    }
+}
+
 impl<FE, T> From<SparseTable<FE, T>> for SparseAccess<FE, T> {
     fn from(table: SparseTable<FE, T>) -> Self {
         Self::Table(table)
@@ -275,6 +295,33 @@ impl<FE, T> fmt::Debug for SparseTable<FE, T> {
             "sparse table with shape {:?}",
             self.table.schema().shape()
         )
+    }
+}
+
+pub struct SparseTableWriteGuard<'a, FE, T> {
+    shape: &'a Shape,
+    table: TableWriteGuard<Schema, IndexSchema, NumberCollator, FE>,
+    dtype: PhantomData<T>,
+}
+
+#[async_trait]
+impl<'a, FE, T> SparseWriteGuard<T> for SparseTableWriteGuard<'a, FE, T>
+where
+    FE: AsType<Node> + Send + Sync + 'static,
+    T: CDatatype + DType + Into<Number>,
+{
+    async fn write_value(&mut self, coord: Coord, value: T) -> Result<(), Error> {
+        self.shape.validate_coord(&coord)?;
+
+        let coord = coord.into_iter().map(Number::from).collect();
+
+        if value == T::zero() {
+            self.table.delete(&coord).await?;
+        } else {
+            self.table.upsert(coord, vec![value.into()]).await?;
+        }
+
+        Ok(())
     }
 }
 
@@ -627,6 +674,12 @@ pub struct SparseCow<FE, T, S> {
     zeros: SparseTable<FE, T>,
 }
 
+impl<FE, T, S> SparseCow<FE, T, S> {
+    pub fn into_deltas(self) -> (SparseTable<FE, T>, SparseTable<FE, T>) {
+        (self.filled, self.zeros)
+    }
+}
+
 impl<FE, T, S> TensorInstance for SparseCow<FE, T, S>
 where
     FE: AsType<Node> + Send + Sync + 'static,
@@ -646,7 +699,7 @@ where
 impl<FE, T, S> SparseInstance for SparseCow<FE, T, S>
 where
     FE: AsType<Node> + Send + Sync + 'static,
-    T: CDatatype + DType + fmt::Debug,
+    T: CDatatype + DType + NumberInstance,
     S: SparseInstance<DType = T>,
     Number: CastInto<T>,
 {
@@ -721,6 +774,24 @@ where
     }
 }
 
+#[async_trait]
+impl<'a, FE, T, S> SparseWrite<'a> for SparseCow<FE, T, S>
+where
+    FE: AsType<Node> + Send + Sync + 'static,
+    T: CDatatype + DType + NumberInstance,
+    S: SparseInstance<DType = T>,
+    Number: CastInto<T>,
+{
+    type Guard = SparseCowWriteGuard<'a, FE, T>;
+
+    async fn write(&'a self) -> Self::Guard {
+        SparseCowWriteGuard {
+            filled: self.filled.write().await,
+            zeros: self.zeros.write().await,
+        }
+    }
+}
+
 impl<FE, T, S: TensorInstance> fmt::Debug for SparseCow<FE, T, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -728,6 +799,32 @@ impl<FE, T, S: TensorInstance> fmt::Debug for SparseCow<FE, T, S> {
             "sparse copy-on-write tensor with shape {:?}",
             self.source.shape()
         )
+    }
+}
+
+pub struct SparseCowWriteGuard<'a, FE, T> {
+    filled: SparseTableWriteGuard<'a, FE, T>,
+    zeros: SparseTableWriteGuard<'a, FE, T>,
+}
+
+#[async_trait]
+impl<'a, FE, T> SparseWriteGuard<T> for SparseCowWriteGuard<'a, FE, T>
+where
+    FE: AsType<Node> + Send + Sync + 'static,
+    T: CDatatype + DType + NumberInstance,
+{
+    async fn write_value(&mut self, coord: Coord, value: T) -> Result<(), Error> {
+        let inverse = if value == T::zero() {
+            T::one()
+        } else {
+            T::zero()
+        };
+
+        try_join!(
+            self.filled.write_value(coord.to_vec(), value),
+            self.zeros.write_value(coord, inverse)
+        )
+        .map(|_| ())
     }
 }
 
@@ -1119,16 +1216,6 @@ where
     }
 }
 
-impl<FE: Send + Sync, T> SparseSlice<SparseTable<FE, T>> {
-    pub async fn write(self) -> SparseWriteGuard<FE, T> {
-        SparseWriteGuard {
-            table: self.source.table.write().await,
-            range: self.range,
-            dtype: self.source.dtype,
-        }
-    }
-}
-
 impl<S> TensorInstance for SparseSlice<S>
 where
     S: TensorInstance,
@@ -1181,6 +1268,24 @@ where
     }
 }
 
+#[async_trait]
+impl<'a, S> SparseWrite<'a> for SparseSlice<S>
+where
+    S: SparseWrite<'a>,
+    S::DType: NumberInstance,
+{
+    type Guard = SparseSliceWriteGuard<'a, S::Guard, S::DType>;
+
+    async fn write(&'a self) -> SparseSliceWriteGuard<'a, S::Guard, S::DType> {
+        SparseSliceWriteGuard {
+            shape: &self.shape,
+            range: &self.range,
+            guard: self.source.write().await,
+            dtype: PhantomData,
+        }
+    }
+}
+
 impl<FE, T, S: Into<SparseAccess<FE, T>>> From<SparseSlice<S>> for SparseAccess<FE, T> {
     fn from(slice: SparseSlice<S>) -> Self {
         Self::Slice(Box::new(SparseSlice {
@@ -1194,6 +1299,26 @@ impl<FE, T, S: Into<SparseAccess<FE, T>>> From<SparseSlice<S>> for SparseAccess<
 impl<S: fmt::Debug> fmt::Debug for SparseSlice<S> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "slice of {:?} with range {:?}", self.source, self.range)
+    }
+}
+
+pub struct SparseSliceWriteGuard<'a, G, T> {
+    shape: &'a Shape,
+    range: &'a Range,
+    guard: G,
+    dtype: PhantomData<T>,
+}
+
+#[async_trait]
+impl<'a, G, T> SparseWriteGuard<T> for SparseSliceWriteGuard<'a, G, T>
+where
+    G: SparseWriteGuard<T>,
+    T: CDatatype + DType,
+{
+    async fn write_value(&mut self, coord: Coord, value: T) -> Result<(), Error> {
+        self.shape.validate_coord(&coord)?;
+        let coord = self.range.invert_coord(coord)?;
+        self.guard.write_value(coord, value).await
     }
 }
 
@@ -1319,31 +1444,6 @@ impl<S: fmt::Debug> fmt::Debug for SparseTranspose<S> {
             "transpose of {:?} with permutation {:?}",
             self.source, self.permutation
         )
-    }
-}
-
-pub struct SparseWriteGuard<FE, T> {
-    table: TableWriteGuard<Schema, IndexSchema, NumberCollator, FE>,
-    range: Range,
-    dtype: PhantomData<T>,
-}
-
-impl<FE, T> SparseWriteGuard<FE, T>
-where
-    FE: AsType<Node> + Send + Sync + 'static,
-    T: CDatatype + DType + Into<Number>,
-{
-    pub async fn write_value(&mut self, coord: Coord, value: T) -> Result<(), Error> {
-        let coord = self.range.invert_coord(coord)?;
-        let coord = coord.into_iter().map(Number::from).collect();
-
-        if value == T::zero() {
-            self.table.delete(&coord).await?;
-        } else {
-            self.table.upsert(coord, vec![value.into()]).await?;
-        }
-
-        Ok(())
     }
 }
 
