@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::fmt;
 use std::marker::PhantomData;
 use std::ops::Bound;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -10,6 +9,7 @@ use b_table::{TableLock, TableWriteGuard};
 use freqfs::DirLock;
 use futures::future::TryFutureExt;
 use futures::stream::{Stream, StreamExt, TryStreamExt};
+use futures::try_join;
 use ha_ndarray::*;
 use itertools::Itertools;
 use number_general::{DType, Number, NumberCollator, NumberType};
@@ -22,14 +22,13 @@ use crate::{
 };
 
 use super::schema::{IndexSchema, Schema};
-use super::stream;
-use super::{Elements, Node};
+use super::{stream, Blocks, Elements, Node};
 
 #[async_trait]
 pub trait SparseInstance: TensorInstance + fmt::Debug {
     type CoordBlock: NDArrayRead<DType = u64> + NDArrayMath + NDArrayTransform;
     type ValueBlock: NDArrayRead<DType = Self::DType>;
-    type Blocks: Stream<Item = Result<(Self::CoordBlock, Self::ValueBlock), Error>>;
+    type Blocks: Stream<Item = Result<(Self::CoordBlock, Self::ValueBlock), Error>> + Send;
     type DType: CDatatype + DType;
 
     async fn blocks(self, range: Range, order: Axes) -> Result<Self::Blocks, Error>;
@@ -115,7 +114,7 @@ where
 {
     type CoordBlock = Array<u64>;
     type ValueBlock = Array<T>;
-    type Blocks = Pin<Box<dyn Stream<Item = Result<(Array<u64>, Array<T>), Error>>>>;
+    type Blocks = Blocks<Array<u64>, Array<T>>;
     type DType = T;
 
     async fn blocks(self, range: Range, order: Axes) -> Result<Self::Blocks, Error> {
@@ -622,6 +621,117 @@ impl<S: fmt::Debug> fmt::Debug for SparseBroadcastAxis<S> {
 }
 
 #[derive(Clone)]
+pub struct SparseCow<FE, T, S> {
+    source: S,
+    filled: SparseTable<FE, T>,
+    zeros: SparseTable<FE, T>,
+}
+
+impl<FE, T, S> TensorInstance for SparseCow<FE, T, S>
+where
+    FE: AsType<Node> + Send + Sync + 'static,
+    T: CDatatype + DType,
+    S: TensorInstance,
+{
+    fn dtype(&self) -> NumberType {
+        T::dtype()
+    }
+
+    fn shape(&self) -> &Shape {
+        self.source.shape()
+    }
+}
+
+#[async_trait]
+impl<FE, T, S> SparseInstance for SparseCow<FE, T, S>
+where
+    FE: AsType<Node> + Send + Sync + 'static,
+    T: CDatatype + DType + fmt::Debug,
+    S: SparseInstance<DType = T>,
+    Number: CastInto<T>,
+{
+    type CoordBlock = ArrayBase<Vec<u64>>;
+    type ValueBlock = ArrayBase<Vec<T>>;
+    type Blocks = Blocks<Self::CoordBlock, Self::ValueBlock>;
+    type DType = T;
+
+    async fn blocks(self, range: Range, order: Axes) -> Result<Self::Blocks, Error> {
+        let shape = self.source.shape().to_vec();
+        let ndim = shape.len();
+        let context = ha_ndarray::Context::default()?;
+        let queue = ha_ndarray::Queue::new(context.clone(), size_hint(self.size()))?;
+
+        let strides = strides_for(&shape, ndim);
+        let strides = ArrayBase::<Arc<Vec<_>>>::with_context(
+            context.clone(),
+            vec![strides.len()],
+            Arc::new(strides),
+        )?;
+
+        let (source_blocks, filled_blocks, zero_blocks) = try_join!(
+            self.source.blocks(range.clone(), order.to_vec()),
+            self.filled.blocks(range.clone(), order.to_vec()),
+            self.zeros.blocks(range, order)
+        )?;
+
+        let source_elements = offsets(queue.clone(), strides.clone(), source_blocks);
+        let filled_elements = offsets(queue.clone(), strides.clone(), filled_blocks);
+        let zero_elements = offsets(queue, strides.clone(), zero_blocks);
+
+        let elements = stream::TryDiff::new(source_elements, zero_elements);
+        let elements = stream::TryMerge::new(elements, filled_elements);
+        let offsets = stream::BlockOffsets::new(elements);
+
+        let dims = ArrayBase::<Arc<Vec<_>>>::with_context(context, vec![ndim], Arc::new(shape))?;
+        let blocks = offsets.map(move |result| {
+            let (offsets, values) = result?;
+
+            let num_offsets = offsets.size();
+            let block_shape = vec![num_offsets, ndim];
+            let coords = offsets
+                .expand_dims(vec![1])?
+                .broadcast(block_shape.to_vec())?
+                .mul(strides.clone().broadcast(block_shape.to_vec())?)?
+                .rem(dims.clone().broadcast(block_shape)?)?;
+
+            let coords = ArrayBase::<Vec<_>>::copy(&coords)?;
+
+            Ok((coords, values))
+        });
+
+        Ok(Box::pin(blocks))
+    }
+
+    async fn elements(self, range: Range, order: Axes) -> Result<Elements<Self::DType>, Error> {
+        let ndim = self.ndim();
+        let blocks = self.blocks(range, order).await?;
+        let elements = blocks
+            .map_ok(move |(coords, values)| {
+                let tuples = coords
+                    .into_inner()
+                    .into_par_iter()
+                    .chunks(ndim)
+                    .zip(values.into_inner());
+
+                futures::stream::iter(tuples.map(Ok).collect::<Vec<_>>())
+            })
+            .try_flatten();
+
+        Ok(Box::pin(elements))
+    }
+}
+
+impl<FE, T, S: TensorInstance> fmt::Debug for SparseCow<FE, T, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "sparse copy-on-write tensor with shape {:?}",
+            self.source.shape()
+        )
+    }
+}
+
+#[derive(Clone)]
 pub struct SparseExpand<S> {
     source: S,
     shape: Shape,
@@ -771,7 +881,7 @@ impl<S: TensorInstance> TensorInstance for SparseReshape<S> {
 impl<S: SparseInstance> SparseInstance for SparseReshape<S> {
     type CoordBlock = ArrayBase<Vec<u64>>;
     type ValueBlock = S::ValueBlock;
-    type Blocks = Pin<Box<dyn Stream<Item = Result<(Self::CoordBlock, Self::ValueBlock), Error>>>>;
+    type Blocks = Blocks<Self::CoordBlock, Self::ValueBlock>;
     type DType = S::DType;
 
     async fn blocks(self, range: Range, order: Axes) -> Result<Self::Blocks, Error> {
@@ -1133,7 +1243,7 @@ where
 {
     type CoordBlock = <S::CoordBlock as NDArrayTransform>::Transpose;
     type ValueBlock = S::ValueBlock;
-    type Blocks = Pin<Box<dyn Stream<Item = Result<(Self::CoordBlock, Self::ValueBlock), Error>>>>;
+    type Blocks = Blocks<Self::CoordBlock, Self::ValueBlock>;
     type DType = S::DType;
 
     async fn blocks(self, range: Range, order: Axes) -> Result<Self::Blocks, Error> {
@@ -1235,6 +1345,38 @@ where
 
         Ok(())
     }
+}
+
+#[inline]
+fn offsets<C, V, T>(
+    queue: ha_ndarray::Queue,
+    strides: ArrayBase<Arc<Vec<u64>>>,
+    blocks: impl Stream<Item = Result<(C, V), Error>> + Send + 'static,
+) -> impl Stream<Item = Result<(u64, T), Error>> + Send
+where
+    C: NDArrayRead<DType = u64> + NDArrayMath,
+    V: NDArrayRead<DType = T>,
+    T: CDatatype,
+{
+    let offsets = blocks
+        .map(move |result| {
+            let (coords, values) = result?;
+
+            let strides = strides.clone().broadcast(coords.shape().to_vec())?;
+            let offsets = coords.mul(strides)?.sum_axis(0)?;
+            let offsets = offsets.read(&queue)?.to_slice()?.into_vec();
+
+            let values = values.read(&queue)?.to_slice()?.into_vec();
+
+            debug_assert_eq!(offsets.len(), values.len());
+
+            Result::<_, Error>::Ok(futures::stream::iter(
+                offsets.into_iter().zip(values).map(Result::<_, Error>::Ok),
+            ))
+        })
+        .try_flatten();
+
+    Box::pin(offsets)
 }
 
 #[inline]

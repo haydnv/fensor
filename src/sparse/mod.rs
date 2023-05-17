@@ -17,7 +17,8 @@ mod stream;
 
 const BLOCK_SIZE: usize = 4_096;
 
-pub type Elements<T> = Pin<Box<dyn Stream<Item = Result<(Coord, T), Error>>>>;
+pub type Blocks<C, V> = Pin<Box<dyn Stream<Item = Result<(C, V), Error>> + Send>>;
+pub type Elements<T> = Pin<Box<dyn Stream<Item = Result<(Coord, T), Error>> + Send>>;
 pub type Node = b_table::b_tree::Node<Vec<Vec<Number>>>;
 
 pub struct SparseTensor<FE, T, A> {
