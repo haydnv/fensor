@@ -5,6 +5,7 @@ use super::{Axes, Error, Range, Shape, TensorInstance, TensorTransform};
 pub use access::*;
 
 mod access;
+mod stream;
 
 #[derive(Clone)]
 pub struct DenseTensor<A> {
