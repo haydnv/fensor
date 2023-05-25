@@ -813,7 +813,7 @@ where
 
 impl<FE, T, S: fmt::Debug> fmt::Debug for SparseCow<FE, T, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "sparse copy-on-write tensor based on {:?}", self.source)
+        write!(f, "copy-on-write view of {:?}", self.source)
     }
 }
 

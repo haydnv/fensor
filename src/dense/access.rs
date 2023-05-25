@@ -538,6 +538,83 @@ impl<S: fmt::Debug> fmt::Debug for DenseBroadcast<S> {
     }
 }
 
+pub struct DenseCow<FE, S> {
+    source: S,
+    dir: DirLock<FE>,
+}
+
+impl<FE, S: Clone> Clone for DenseCow<FE, S> {
+    fn clone(&self) -> Self {
+        Self {
+            source: self.source.clone(),
+            dir: self.dir.clone(),
+        }
+    }
+}
+
+impl<FE, S> TensorInstance for DenseCow<FE, S>
+where
+    FE: Send + Sync + 'static,
+    S: TensorInstance,
+{
+    fn dtype(&self) -> NumberType {
+        self.source.dtype()
+    }
+
+    fn shape(&self) -> &Shape {
+        self.source.shape()
+    }
+}
+
+#[async_trait]
+impl<FE, S> DenseInstance for DenseCow<FE, S>
+where
+    FE: AsType<ArrayBase<S::DType>> + FileLoad + Send + Sync + 'static,
+    S: DenseInstance + Clone,
+    Array<S::DType>: From<S::Block> + From<ArrayBase<S::DType>>,
+    ArrayBase<S::DType>: de::FromStream<Context = ()>,
+{
+    type Block = Array<S::DType>;
+    type DType = S::DType;
+
+    fn block_size(&self) -> usize {
+        self.source.block_size()
+    }
+
+    async fn read_block(&self, block_id: u64) -> Result<Self::Block, Error> {
+        let dir = self.dir.read().await;
+
+        if let Some(block) = dir.get_file(&block_id) {
+            block
+                .read_owned()
+                .map_ok(|block| block.clone().into())
+                .map_err(Error::from)
+                .await
+        } else {
+            self.source.read_block(block_id).map_ok(Array::from).await
+        }
+    }
+
+    async fn into_blocks(self) -> Result<BlockStream<Self::Block>, Error> {
+        let num_blocks = div_ceil(self.size(), self.block_size() as u64);
+
+        let blocks = stream::iter(0..num_blocks)
+            .map(move |block_id| {
+                let this = self.clone();
+                async move { this.read_block(block_id).await }
+            })
+            .buffered(num_cpus::get());
+
+        Ok(Box::pin(blocks))
+    }
+}
+
+impl<FE, S: TensorInstance + fmt::Debug> fmt::Debug for DenseCow<FE, S> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "copy-on-write view of {:?}", self.source)
+    }
+}
+
 #[derive(Clone)]
 pub struct DenseReshape<S> {
     source: S,
