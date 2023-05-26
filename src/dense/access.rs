@@ -1,21 +1,25 @@
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::{fmt, io};
 
 use async_trait::async_trait;
 use destream::de;
-use freqfs::{DirLock, FileLoad, FileReadGuardOwned};
+use freqfs::{DirLock, DirReadGuard, FileLoad, FileReadGuardOwned};
 use futures::{stream, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use ha_ndarray::*;
 use number_general::{DType, NumberClass, NumberInstance, NumberType};
 use safecast::AsType;
 
 use crate::{
-    validate_transpose, Axes, AxisRange, Error, Range, Shape, TensorInstance, IDEAL_BLOCK_SIZE,
+    offset_of, validate_transpose, Axes, AxisRange, Coord, Error, Range, Shape, TensorInstance,
+    IDEAL_BLOCK_SIZE,
 };
 
+use super::stream::BlockResize;
+
 type BlockShape = ha_ndarray::Shape;
-type BlockStream<Block> = Pin<Box<dyn Stream<Item = Result<Block, Error>>>>;
+type BlockStream<Block> = Pin<Box<dyn Stream<Item = Result<Block, Error>> + Send>>;
 
 #[async_trait]
 pub trait DenseInstance: TensorInstance + fmt::Debug + Send + Sync + 'static {
@@ -45,6 +49,20 @@ impl<T: DenseInstance> DenseInstance for Box<T> {
     async fn into_blocks(self) -> Result<BlockStream<Self::Block>, Error> {
         (*self).into_blocks().await
     }
+}
+
+#[async_trait]
+pub trait DenseWrite<'a>: DenseInstance {
+    type Guard: DenseWriteGuard<Self::DType>;
+
+    async fn write(&'a self) -> Self::Guard;
+}
+
+#[async_trait]
+pub trait DenseWriteGuard<T> {
+    async fn overwrite<O: DenseInstance<DType = T>>(&self, other: O) -> Result<(), Error>;
+
+    async fn write_value(&self, coord: Coord, value: T) -> Result<(), Error>;
 }
 
 pub enum DenseAccess<FE, T> {
@@ -406,6 +424,26 @@ where
     }
 }
 
+#[async_trait]
+impl<'a, FE, T> DenseWrite<'a> for DenseFile<FE, T>
+where
+    FE: FileLoad + AsType<Buffer<T>>,
+    T: CDatatype + DType + 'static,
+    Buffer<T>: de::FromStream<Context = ()>,
+{
+    type Guard = DenseFileWriteGuard<'a, FE>;
+
+    async fn write(&'a self) -> Self::Guard {
+        let dir = self.dir.read().await;
+
+        DenseFileWriteGuard {
+            dir: Arc::new(dir),
+            block_size: self.block_size,
+            shape: &self.shape,
+        }
+    }
+}
+
 impl<FE, T> From<DenseFile<FE, T>> for DenseAccess<FE, T> {
     fn from(file: DenseFile<FE, T>) -> Self {
         Self::File(file)
@@ -415,6 +453,62 @@ impl<FE, T> From<DenseFile<FE, T>> for DenseAccess<FE, T> {
 impl<FE, T> fmt::Debug for DenseFile<FE, T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "dense tensor with shape {:?}", self.shape)
+    }
+}
+
+pub struct DenseFileWriteGuard<'a, FE> {
+    dir: Arc<DirReadGuard<'a, FE>>,
+    block_size: usize,
+    shape: &'a Shape,
+}
+
+#[async_trait]
+impl<'a, FE, T> DenseWriteGuard<T> for DenseFileWriteGuard<'a, FE>
+where
+    FE: FileLoad + AsType<Buffer<T>>,
+    T: CDatatype + DType + 'static,
+    Buffer<T>: de::FromStream<Context = ()>,
+{
+    async fn overwrite<O: DenseInstance<DType = T>>(&self, other: O) -> Result<(), Error> {
+        let block_axis = block_axis_for(&self.shape, self.block_size);
+        let block_shape = block_shape_for(block_axis, &self.shape, self.block_size);
+
+        let context = ha_ndarray::Context::default()?;
+        let queue = ha_ndarray::Queue::new(context, block_shape.iter().product())?;
+
+        let blocks = other.into_blocks().await?;
+        let blocks = BlockResize::new(blocks, block_shape)?;
+
+        blocks
+            .enumerate()
+            .map(|(block_id, result)| {
+                let dir = self.dir.clone();
+                let queue = queue.clone();
+
+                async move {
+                    let data = result?;
+                    let data = data.read(&queue)?;
+                    let mut block = dir.write_file(&block_id).await?;
+                    debug_assert_eq!(block.len(), data.len());
+                    block.write(data)?;
+                    Result::<(), Error>::Ok(())
+                }
+            })
+            .buffered(num_cpus::get())
+            .try_fold((), |(), ()| futures::future::ready(Ok(())))
+            .await
+    }
+
+    async fn write_value(&self, coord: Coord, value: T) -> Result<(), Error> {
+        self.shape.validate_coord(&coord)?;
+
+        let offset = offset_of(coord, &self.shape);
+        let block_id = offset / self.block_size as u64;
+
+        let mut block = self.dir.write_file(&block_id).await?;
+        block.write_value((offset % self.block_size as u64) as usize, value)?;
+
+        Ok(())
     }
 }
 

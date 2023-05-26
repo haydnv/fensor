@@ -381,6 +381,19 @@ where
 }
 
 #[inline]
+fn offset_of(coord: Coord, shape: &[u64]) -> u64 {
+    let strides = shape.iter().enumerate().map(|(x, dim)| {
+        if *dim == 1 {
+            0
+        } else {
+            shape.iter().rev().take(shape.len() - 1 - x).product()
+        }
+    });
+
+    coord.into_iter().zip(strides).map(|(i, dim)| i * dim).sum()
+}
+
+#[inline]
 fn strides_for(shape: &[u64], ndim: usize) -> Strides {
     debug_assert!(ndim >= shape.len());
 

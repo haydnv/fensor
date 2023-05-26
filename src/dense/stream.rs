@@ -10,7 +10,7 @@ use pin_project::pin_project;
 use crate::Error;
 
 #[pin_project]
-struct BlockResize<S, T> {
+pub struct BlockResize<S, T> {
     #[pin]
     source: Fuse<S>,
     shape: Shape,
