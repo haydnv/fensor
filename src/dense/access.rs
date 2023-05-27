@@ -1174,7 +1174,7 @@ where
 }
 
 #[async_trait]
-impl<'a, S: DenseWrite + Clone> DenseWriteLock<'a> for DenseSlice<S>
+impl<'a, S: DenseWrite + DenseWriteLock<'a> + Clone> DenseWriteLock<'a> for DenseSlice<S>
 where
     S::Block: NDArrayTransform,
     <S::Block as NDArrayTransform>::Slice:
@@ -1186,9 +1186,7 @@ where
     type WriteGuard = DenseSliceWriteGuard<'a, S>;
 
     async fn write(&'a self) -> Self::WriteGuard {
-        DenseSliceWriteGuard {
-            source: &self.source,
-        }
+        DenseSliceWriteGuard { dest: self }
     }
 }
 
@@ -1211,20 +1209,42 @@ impl<S: fmt::Debug> fmt::Debug for DenseSlice<S> {
 }
 
 pub struct DenseSliceWriteGuard<'a, S> {
-    source: &'a S,
+    dest: &'a DenseSlice<S>,
 }
 
 #[async_trait]
 impl<'a, S> DenseWriteGuard<S::DType> for DenseSliceWriteGuard<'a, S>
 where
-    S: DenseWrite,
+    S: DenseWrite + DenseWriteLock<'a> + Clone,
+    S::Block: NDArrayTransform,
+    <S::Block as NDArrayTransform>::Slice:
+        NDArrayRead<DType = S::DType> + NDArrayTransform + Into<Array<S::DType>>,
+    S::BlockWrite: NDArrayTransform,
+    <S::BlockWrite as NDArrayTransform>::Slice:
+        NDArrayRead<DType = S::DType> + NDArrayTransform + NDArrayWrite + Into<Array<S::DType>>,
 {
     async fn overwrite<O: DenseInstance<DType = S::DType>>(&self, other: O) -> Result<(), Error> {
-        todo!()
+        let block_axis = block_axis_for(self.dest.shape(), self.dest.block_size);
+        let block_shape = block_shape_for(block_axis, self.dest.shape(), self.dest.block_size);
+
+        let dest = self.dest.clone().write_blocks().await?;
+        let source = other.read_blocks().await?;
+        let source = BlockResize::new(source, block_shape)?;
+
+        dest.zip(source)
+            .map(|(dest, source)| {
+                let mut dest = dest?;
+                let source = source?;
+                dest.write(&source).map_err(Error::from)
+            })
+            .try_fold((), |(), _| futures::future::ready(Ok(())))
+            .await
     }
 
     async fn write_value(&self, coord: Coord, value: S::DType) -> Result<(), Error> {
-        todo!()
+        let source_coord = self.dest.range.invert_coord(coord)?;
+        let source = self.dest.source.write().await;
+        source.write_value(source_coord, value).await
     }
 }
 
