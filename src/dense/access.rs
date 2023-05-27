@@ -709,6 +709,33 @@ impl<FE, S: Clone> Clone for DenseCow<FE, S> {
     }
 }
 
+impl<FE, T> DenseCow<FE, DenseFile<FE, T>>
+where
+    FE: AsType<Buffer<T>> + FileLoad,
+    T: CDatatype + DType,
+    Buffer<T>: de::FromStream<Context = ()>,
+{
+    async fn write_buffer(
+        &self,
+        block_id: u64,
+    ) -> Result<FileWriteGuardOwned<FE, Buffer<T>>, Error> {
+        let mut dir = self.dir.write().await;
+
+        if let Some(block) = dir.get_file(&block_id) {
+            block.write_owned().map_err(Error::from).await
+        } else {
+            let block = self.source.read_block(block_id).await?;
+            let buffer = block.into_inner().clone();
+
+            let type_size = T::dtype().size();
+            let block_data_size = type_size * buffer.len();
+            let block = dir.create_file(block_id.to_string(), buffer, block_data_size)?;
+
+            block.into_write().map_err(Error::from).await
+        }
+    }
+}
+
 impl<FE, S> TensorInstance for DenseCow<FE, S>
 where
     FE: Send + Sync + 'static,
@@ -783,21 +810,7 @@ where
     type BlockWrite = ArrayBase<FileWriteGuardOwned<FE, Buffer<T>>>;
 
     async fn write_block(&self, block_id: u64) -> Result<Self::BlockWrite, Error> {
-        let mut dir = self.dir.write().await;
-
-        let buffer = if let Some(block) = dir.get_file(&block_id) {
-            block.write_owned().map_err(Error::from).await?
-        } else {
-            let block = self.source.read_block(block_id).await?;
-            let buffer = block.into_inner().clone();
-
-            let type_size = T::dtype().size();
-            let block_data_size = type_size * buffer.len();
-            let block = dir.create_file(block_id.to_string(), buffer, block_data_size)?;
-
-            block.into_write().await?
-        };
-
+        let buffer = self.write_buffer(block_id).await?;
         let block_axis = block_axis_for(self.shape(), self.block_size());
         let block_shape = block_shape_for(block_axis, self.shape(), buffer.len());
         ArrayBase::<FileWriteGuardOwned<FE, Buffer<T>>>::new(block_shape, buffer)
@@ -808,19 +821,74 @@ where
         let num_blocks = div_ceil(self.size(), self.block_size() as u64);
         let blocks = stream::iter(0..num_blocks).then(move |block_id| {
             let this = self.clone();
-
-            async move {
-                this.write_block(block_id).await
-            }
+            async move { this.write_block(block_id).await }
         });
 
         Ok(Box::pin(blocks))
     }
 }
 
+#[async_trait]
+impl<'a, FE, T> DenseWriteLock<'a> for DenseCow<FE, DenseFile<FE, T>>
+where
+    FE: AsType<Buffer<T>> + FileLoad,
+    T: CDatatype + DType + 'static,
+    Buffer<T>: de::FromStream<Context = ()>,
+{
+    type WriteGuard = DenseCowWriteGuard<'a, FE, T>;
+
+    async fn write(&'a self) -> Self::WriteGuard {
+        DenseCowWriteGuard { cow: self }
+    }
+}
+
 impl<FE, S: TensorInstance + fmt::Debug> fmt::Debug for DenseCow<FE, S> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "copy-on-write view of {:?}", self.source)
+    }
+}
+
+pub struct DenseCowWriteGuard<'a, FE, T> {
+    cow: &'a DenseCow<FE, DenseFile<FE, T>>,
+}
+
+#[async_trait]
+impl<'a, FE, T> DenseWriteGuard<T> for DenseCowWriteGuard<'a, FE, T>
+where
+    FE: AsType<Buffer<T>> + FileLoad,
+    T: CDatatype + DType + 'static,
+    Buffer<T>: de::FromStream<Context = ()>,
+{
+    async fn overwrite<O: DenseInstance<DType = T>>(&self, other: O) -> Result<(), Error> {
+        let source = other.read_blocks().await?;
+
+        let block_axis = block_axis_for(self.cow.shape(), self.cow.block_size());
+        let block_shape = block_shape_for(block_axis, self.cow.shape(), self.cow.block_size());
+        let source = BlockResize::new(source, block_shape)?;
+
+        let dest = self.cow.clone().write_blocks().await?;
+
+        dest.zip(source)
+            .map(|(dest, source)| {
+                let mut dest = dest?;
+                let source = source?;
+                dest.write(&source).map_err(Error::from)
+            })
+            .try_fold((), |(), _| futures::future::ready(Ok(())))
+            .await
+    }
+
+    async fn write_value(&self, coord: Coord, value: T) -> Result<(), Error> {
+        self.cow.shape().validate_coord(&coord)?;
+
+        let offset = offset_of(coord, self.cow.shape());
+        let block_id = offset / self.cow.block_size() as u64;
+        let block_offset = offset % self.cow.block_size() as u64;
+        let mut buffer = self.cow.write_buffer(block_id).await?;
+
+        buffer
+            .write_value(block_offset as usize, value)
+            .map_err(Error::from)
     }
 }
 
