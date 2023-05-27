@@ -5,8 +5,9 @@ use std::{fmt, io};
 
 use async_trait::async_trait;
 use destream::de;
-use freqfs::{DirLock, DirReadGuard, FileLoad, FileReadGuardOwned};
-use futures::{stream, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use freqfs::{DirLock, DirReadGuard, FileLoad, FileReadGuardOwned, FileWriteGuardOwned};
+use futures::future::{Future, TryFutureExt};
+use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use ha_ndarray::*;
 use number_general::{DType, NumberClass, NumberInstance, NumberType};
 use safecast::AsType;
@@ -30,7 +31,7 @@ pub trait DenseInstance: TensorInstance + fmt::Debug + Send + Sync + 'static {
 
     async fn read_block(&self, block_id: u64) -> Result<Self::Block, Error>;
 
-    async fn into_blocks(self) -> Result<BlockStream<Self::Block>, Error>;
+    async fn read_blocks(self) -> Result<BlockStream<Self::Block>, Error>;
 }
 
 #[async_trait]
@@ -46,20 +47,29 @@ impl<T: DenseInstance> DenseInstance for Box<T> {
         (**self).read_block(block_id).await
     }
 
-    async fn into_blocks(self) -> Result<BlockStream<Self::Block>, Error> {
-        (*self).into_blocks().await
+    async fn read_blocks(self) -> Result<BlockStream<Self::Block>, Error> {
+        (*self).read_blocks().await
     }
 }
 
 #[async_trait]
-pub trait DenseWrite<'a>: DenseInstance {
-    type Guard: DenseWriteGuard<Self::DType>;
+pub trait DenseWrite: DenseInstance {
+    type BlockWrite: NDArrayWrite<DType = Self::DType>;
 
-    async fn write(&'a self) -> Self::Guard;
+    async fn write_block(&self, block_id: u64) -> Result<Self::BlockWrite, Error>;
+
+    async fn write_blocks(self) -> Result<BlockStream<Self::BlockWrite>, Error>;
 }
 
 #[async_trait]
-pub trait DenseWriteGuard<T> {
+pub trait DenseWriteLock<'a>: DenseInstance {
+    type WriteGuard: DenseWriteGuard<Self::DType>;
+
+    async fn write(&'a self) -> Self::WriteGuard;
+}
+
+#[async_trait]
+pub trait DenseWriteGuard<T>: Send + Sync {
     async fn overwrite<O: DenseInstance<DType = T>>(&self, other: O) -> Result<(), Error>;
 
     async fn write_value(&self, coord: Coord, value: T) -> Result<(), Error>;
@@ -133,18 +143,18 @@ where
         )
     }
 
-    async fn into_blocks(self) -> Result<BlockStream<Self::Block>, Error> {
+    async fn read_blocks(self) -> Result<BlockStream<Self::Block>, Error> {
         match self {
-            Self::File(file) => Ok(Box::pin(file.into_blocks().await?.map_ok(Array::from))),
+            Self::File(file) => Ok(Box::pin(file.read_blocks().await?.map_ok(Array::from))),
             Self::Broadcast(broadcast) => {
-                Ok(Box::pin(broadcast.into_blocks().await?.map_ok(Array::from)))
+                Ok(Box::pin(broadcast.read_blocks().await?.map_ok(Array::from)))
             }
             Self::Reshape(reshape) => {
-                Ok(Box::pin(reshape.into_blocks().await?.map_ok(Array::from)))
+                Ok(Box::pin(reshape.read_blocks().await?.map_ok(Array::from)))
             }
-            Self::Slice(slice) => Ok(Box::pin(slice.into_blocks().await?.map_ok(Array::from))),
+            Self::Slice(slice) => Ok(Box::pin(slice.read_blocks().await?.map_ok(Array::from))),
             Self::Transpose(transpose) => {
-                Ok(Box::pin(transpose.into_blocks().await?.map_ok(Array::from)))
+                Ok(Box::pin(transpose.read_blocks().await?.map_ok(Array::from)))
             }
         }
     }
@@ -396,7 +406,7 @@ where
             .map_err(Error::from)
     }
 
-    async fn into_blocks(self) -> Result<BlockStream<Self::Block>, Error> {
+    async fn read_blocks(self) -> Result<BlockStream<Self::Block>, Error> {
         let shape = self.shape;
         let block_axis = block_axis_for(&shape, self.block_size);
         let dir = self.dir.into_read().await;
@@ -425,15 +435,68 @@ where
 }
 
 #[async_trait]
-impl<'a, FE, T> DenseWrite<'a> for DenseFile<FE, T>
+impl<'a, FE, T> DenseWrite for DenseFile<FE, T>
 where
     FE: FileLoad + AsType<Buffer<T>>,
     T: CDatatype + DType + 'static,
     Buffer<T>: de::FromStream<Context = ()>,
 {
-    type Guard = DenseFileWriteGuard<'a, FE>;
+    type BlockWrite = ArrayBase<FileWriteGuardOwned<FE, Buffer<T>>>;
 
-    async fn write(&'a self) -> Self::Guard {
+    async fn write_block(&self, block_id: u64) -> Result<Self::BlockWrite, Error> {
+        let dir = self.dir.read().await;
+        let file = dir.get_file(&block_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("dense tensor block {}", block_id),
+            )
+        })?;
+
+        let buffer = file.write_owned().await?;
+        let block_axis = block_axis_for(self.shape(), self.block_size);
+        let block_shape = block_shape_for(block_axis, &self.shape, buffer.len());
+        ArrayBase::<FileWriteGuardOwned<FE, Buffer<T>>>::new(block_shape, buffer)
+            .map_err(Error::from)
+    }
+
+    async fn write_blocks(self) -> Result<BlockStream<Self::BlockWrite>, Error> {
+        let shape = self.shape;
+        let block_axis = block_axis_for(&shape, self.block_size);
+        let dir = self.dir.into_read().await;
+
+        let blocks = stream::iter(self.block_map.into_inner())
+            .map(move |block_id| {
+                dir.get_file(&block_id).cloned().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("dense tensor block {}", block_id),
+                    )
+                    .into()
+                })
+            })
+            .map_ok(|block| block.into_write())
+            .try_buffered(num_cpus::get())
+            .map(move |result| {
+                let buffer = result?;
+                let block_shape = block_shape_for(block_axis, &shape, buffer.len());
+                ArrayBase::<FileWriteGuardOwned<FE, Buffer<T>>>::new(block_shape, buffer)
+                    .map_err(Error::from)
+            });
+
+        Ok(Box::pin(blocks))
+    }
+}
+
+#[async_trait]
+impl<'a, FE, T> DenseWriteLock<'a> for DenseFile<FE, T>
+where
+    FE: FileLoad + AsType<Buffer<T>>,
+    T: CDatatype + DType + 'static,
+    Buffer<T>: de::FromStream<Context = ()>,
+{
+    type WriteGuard = DenseFileWriteGuard<'a, FE>;
+
+    async fn write(&'a self) -> Self::WriteGuard {
         let dir = self.dir.read().await;
 
         DenseFileWriteGuard {
@@ -476,7 +539,7 @@ where
         let context = ha_ndarray::Context::default()?;
         let queue = ha_ndarray::Queue::new(context, block_shape.iter().product())?;
 
-        let blocks = other.into_blocks().await?;
+        let blocks = other.read_blocks().await?;
         let blocks = BlockResize::new(blocks, block_shape)?;
 
         blocks
@@ -594,7 +657,7 @@ where
         source_block.broadcast(block_shape).map_err(Error::from)
     }
 
-    async fn into_blocks(self) -> Result<BlockStream<Self::Block>, Error> {
+    async fn read_blocks(self) -> Result<BlockStream<Self::Block>, Error> {
         let block_axis = block_axis_for(&self.shape, self.block_size);
         let block_shape = block_shape_for(block_axis, &self.shape, self.block_size);
 
@@ -689,7 +752,7 @@ where
         }
     }
 
-    async fn into_blocks(self) -> Result<BlockStream<Self::Block>, Error> {
+    async fn read_blocks(self) -> Result<BlockStream<Self::Block>, Error> {
         let num_blocks = div_ceil(self.size(), self.block_size() as u64);
 
         let blocks = stream::iter(0..num_blocks)
@@ -767,12 +830,12 @@ where
         block.reshape(block_shape).map_err(Error::from)
     }
 
-    async fn into_blocks(self) -> Result<BlockStream<Self::Block>, Error> {
+    async fn read_blocks(self) -> Result<BlockStream<Self::Block>, Error> {
         let block_size = self.block_size();
         let block_axis = block_axis_for(self.shape(), block_size);
         let block_shape = block_shape_for(block_axis, self.shape(), block_size);
 
-        let source_blocks = self.source.into_blocks().await?;
+        let source_blocks = self.source.read_blocks().await?;
         let blocks = source_blocks.map(move |result| {
             let block = result?;
             let mut block_shape = block_shape.to_vec();
@@ -914,33 +977,9 @@ impl<S: DenseInstance> DenseSlice<S> {
             block_size,
         })
     }
-}
 
-impl<S: TensorInstance> TensorInstance for DenseSlice<S> {
-    fn dtype(&self) -> NumberType {
-        self.source.dtype()
-    }
-
-    fn shape(&self) -> &Shape {
-        &self.shape
-    }
-}
-
-#[async_trait]
-impl<S: DenseInstance + Clone> DenseInstance for DenseSlice<S>
-where
-    S::Block: NDArrayTransform,
-    <S::Block as NDArrayTransform>::Slice:
-        NDArrayRead<DType = S::DType> + NDArrayTransform + Into<Array<S::DType>>,
-{
-    type Block = <S::Block as NDArrayTransform>::Slice;
-    type DType = S::DType;
-
-    fn block_size(&self) -> usize {
-        self.block_size
-    }
-
-    async fn read_block(&self, block_id: u64) -> Result<Self::Block, Error> {
+    #[inline]
+    fn block_bounds(&self, block_id: u64) -> Result<(u64, Vec<ha_ndarray::AxisBound>), Error> {
         let source_block_id = source_block_id_for(&self.block_map, block_id)?;
 
         let block_axis = block_axis_for(&self.shape, self.block_size);
@@ -984,11 +1023,20 @@ where
             block_bounds[0] = local_bound;
         }
 
-        let source_block = self.source.read_block(source_block_id).await?;
-        source_block.slice(block_bounds).map_err(Error::from)
+        Ok((source_block_id, block_bounds))
     }
+}
 
-    async fn into_blocks(self) -> Result<BlockStream<Self::Block>, Error> {
+impl<S: DenseInstance + Clone> DenseSlice<S> {
+    async fn block_stream<Get, Fut, Block>(
+        self,
+        get_block: Get,
+    ) -> Result<impl Stream<Item = Result<Block::Slice, Error>>, Error>
+    where
+        Get: Fn(S, u64) -> Fut + Copy,
+        Fut: Future<Output = Result<Block, Error>>,
+        Block: NDArrayTransform,
+    {
         let block_map = self.block_map;
         let range = self.range;
         let ndim = self.shape.len();
@@ -1042,7 +1090,7 @@ where
                 let source = source.clone();
 
                 async move {
-                    let block = source.read_block(block_id).await?;
+                    let block = get_block(source, block_id).await?;
 
                     if block_bounds.is_empty() {
                         block_bounds.push(local_bound);
@@ -1056,6 +1104,91 @@ where
             .buffered(num_cpus::get());
 
         Ok(Box::pin(blocks))
+    }
+}
+
+impl<S: TensorInstance> TensorInstance for DenseSlice<S> {
+    fn dtype(&self) -> NumberType {
+        self.source.dtype()
+    }
+
+    fn shape(&self) -> &Shape {
+        &self.shape
+    }
+}
+
+#[async_trait]
+impl<S: DenseInstance + Clone> DenseInstance for DenseSlice<S>
+where
+    S::Block: NDArrayTransform,
+    <S::Block as NDArrayTransform>::Slice:
+        NDArrayRead<DType = S::DType> + NDArrayTransform + Into<Array<S::DType>>,
+{
+    type Block = <S::Block as NDArrayTransform>::Slice;
+    type DType = S::DType;
+
+    fn block_size(&self) -> usize {
+        self.block_size
+    }
+
+    async fn read_block(&self, block_id: u64) -> Result<Self::Block, Error> {
+        let (source_block_id, block_bounds) = self.block_bounds(block_id)?;
+        let source_block = self.source.read_block(source_block_id).await?;
+        source_block.slice(block_bounds).map_err(Error::from)
+    }
+
+    async fn read_blocks(self) -> Result<BlockStream<Self::Block>, Error> {
+        let blocks = self
+            .block_stream(|source, block_id| async move { source.read_block(block_id).await })
+            .await?;
+
+        Ok(Box::pin(blocks))
+    }
+}
+
+#[async_trait]
+impl<'a, S: DenseWrite + Clone> DenseWrite for DenseSlice<S>
+where
+    S::Block: NDArrayTransform,
+    <S::Block as NDArrayTransform>::Slice:
+        NDArrayRead<DType = S::DType> + NDArrayTransform + Into<Array<S::DType>>,
+    S::BlockWrite: NDArrayTransform,
+    <S::BlockWrite as NDArrayTransform>::Slice:
+        NDArrayRead<DType = S::DType> + NDArrayTransform + NDArrayWrite + Into<Array<S::DType>>,
+{
+    type BlockWrite = <S::BlockWrite as NDArrayTransform>::Slice;
+
+    async fn write_block(&self, block_id: u64) -> Result<Self::BlockWrite, Error> {
+        let (source_block_id, block_bounds) = self.block_bounds(block_id)?;
+        let source_block = self.source.write_block(source_block_id).await?;
+        source_block.slice(block_bounds).map_err(Error::from)
+    }
+
+    async fn write_blocks(self) -> Result<BlockStream<Self::BlockWrite>, Error> {
+        let blocks = self
+            .block_stream(|source, block_id| async move { source.write_block(block_id).await })
+            .await?;
+
+        Ok(Box::pin(blocks))
+    }
+}
+
+#[async_trait]
+impl<'a, S: DenseWrite + Clone> DenseWriteLock<'a> for DenseSlice<S>
+where
+    S::Block: NDArrayTransform,
+    <S::Block as NDArrayTransform>::Slice:
+        NDArrayRead<DType = S::DType> + NDArrayTransform + Into<Array<S::DType>>,
+    S::BlockWrite: NDArrayTransform,
+    <S::BlockWrite as NDArrayTransform>::Slice:
+        NDArrayRead<DType = S::DType> + NDArrayTransform + NDArrayWrite + Into<Array<S::DType>>,
+{
+    type WriteGuard = DenseSliceWriteGuard<'a, S>;
+
+    async fn write(&'a self) -> Self::WriteGuard {
+        DenseSliceWriteGuard {
+            source: &self.source,
+        }
     }
 }
 
@@ -1074,6 +1207,24 @@ impl<FE, T, S: Into<DenseAccess<FE, T>>> From<DenseSlice<S>> for DenseAccess<FE,
 impl<S: fmt::Debug> fmt::Debug for DenseSlice<S> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "slice {:?} from {:?}", self.range, self.source)
+    }
+}
+
+pub struct DenseSliceWriteGuard<'a, S> {
+    source: &'a S,
+}
+
+#[async_trait]
+impl<'a, S> DenseWriteGuard<S::DType> for DenseSliceWriteGuard<'a, S>
+where
+    S: DenseWrite,
+{
+    async fn overwrite<O: DenseInstance<DType = S::DType>>(&self, other: O) -> Result<(), Error> {
+        todo!()
+    }
+
+    async fn write_value(&self, coord: Coord, value: S::DType) -> Result<(), Error> {
+        todo!()
     }
 }
 
@@ -1162,7 +1313,7 @@ where
             .map_err(Error::from)
     }
 
-    async fn into_blocks(self) -> Result<BlockStream<Self::Block>, Error> {
+    async fn read_blocks(self) -> Result<BlockStream<Self::Block>, Error> {
         let permutation = self.permutation;
 
         let blocks = stream::iter(self.block_map.into_inner())
