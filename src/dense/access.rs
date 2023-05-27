@@ -726,10 +726,10 @@ where
 #[async_trait]
 impl<FE, S> DenseInstance for DenseCow<FE, S>
 where
-    FE: AsType<ArrayBase<S::DType>> + FileLoad + Send + Sync + 'static,
+    FE: AsType<Buffer<S::DType>> + FileLoad + Send + Sync + 'static,
     S: DenseInstance + Clone,
-    Array<S::DType>: From<S::Block> + From<ArrayBase<S::DType>>,
-    ArrayBase<S::DType>: de::FromStream<Context = ()>,
+    Array<S::DType>: From<S::Block>,
+    Buffer<S::DType>: de::FromStream<Context = ()>,
 {
     type Block = Array<S::DType>;
     type DType = S::DType;
@@ -742,11 +742,18 @@ where
         let dir = self.dir.read().await;
 
         if let Some(block) = dir.get_file(&block_id) {
-            block
+            let buffer: Buffer<S::DType> = block
                 .read_owned()
                 .map_ok(|block| block.clone().into())
                 .map_err(Error::from)
-                .await
+                .await?;
+
+            let block_axis = block_axis_for(self.shape(), self.block_size());
+            let block_data_size = S::DType::dtype().size() * buffer.len();
+            let block_shape = block_shape_for(block_axis, self.shape(), block_data_size);
+            let block = ArrayBase::<Buffer<S::DType>>::new(block_shape, buffer)?;
+
+            Ok(block.into())
         } else {
             self.source.read_block(block_id).map_ok(Array::from).await
         }
@@ -761,6 +768,51 @@ where
                 async move { this.read_block(block_id).await }
             })
             .buffered(num_cpus::get());
+
+        Ok(Box::pin(blocks))
+    }
+}
+
+#[async_trait]
+impl<FE, T> DenseWrite for DenseCow<FE, DenseFile<FE, T>>
+where
+    FE: AsType<Buffer<T>> + FileLoad,
+    T: CDatatype + DType + 'static,
+    Buffer<T>: de::FromStream<Context = ()>,
+{
+    type BlockWrite = ArrayBase<FileWriteGuardOwned<FE, Buffer<T>>>;
+
+    async fn write_block(&self, block_id: u64) -> Result<Self::BlockWrite, Error> {
+        let mut dir = self.dir.write().await;
+
+        let buffer = if let Some(block) = dir.get_file(&block_id) {
+            block.write_owned().map_err(Error::from).await?
+        } else {
+            let block = self.source.read_block(block_id).await?;
+            let buffer = block.into_inner().clone();
+
+            let type_size = T::dtype().size();
+            let block_data_size = type_size * buffer.len();
+            let block = dir.create_file(block_id.to_string(), buffer, block_data_size)?;
+
+            block.into_write().await?
+        };
+
+        let block_axis = block_axis_for(self.shape(), self.block_size());
+        let block_shape = block_shape_for(block_axis, self.shape(), buffer.len());
+        ArrayBase::<FileWriteGuardOwned<FE, Buffer<T>>>::new(block_shape, buffer)
+            .map_err(Error::from)
+    }
+
+    async fn write_blocks(self) -> Result<BlockStream<Self::BlockWrite>, Error> {
+        let num_blocks = div_ceil(self.size(), self.block_size() as u64);
+        let blocks = stream::iter(0..num_blocks).then(move |block_id| {
+            let this = self.clone();
+
+            async move {
+                this.write_block(block_id).await
+            }
+        });
 
         Ok(Box::pin(blocks))
     }
