@@ -5,6 +5,7 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use b_table::b_tree::Collator;
 use b_table::{TableLock, TableWriteGuard};
 use freqfs::DirLock;
 use futures::future::TryFutureExt;
@@ -218,11 +219,32 @@ impl<FE, T> Clone for SparseTable<FE, T> {
     }
 }
 
+impl<FE, T> SparseTable<FE, T> {
+    pub fn collator(&self) -> &Arc<Collator<NumberCollator>> {
+        self.table.collator()
+    }
+
+    pub fn schema(&self) -> &Schema {
+        self.table.schema()
+    }
+}
+
 impl<FE: AsType<Node> + Send + Sync, T> SparseTable<FE, T> {
-    pub async fn create(dir: DirLock<FE>, shape: Shape) -> Result<Self, Error> {
+    pub fn create(dir: DirLock<FE>, shape: Shape) -> Result<Self, Error> {
         let schema = Schema::new(shape);
         let collator = NumberCollator::default();
         let table = TableLock::create(schema, collator, dir)?;
+
+        Ok(Self {
+            table,
+            dtype: PhantomData,
+        })
+    }
+
+    pub fn load(dir: DirLock<FE>, shape: Shape) -> Result<Self, Error> {
+        let schema = Schema::new(shape);
+        let collator = NumberCollator::default();
+        let table = TableLock::load(schema, collator, dir)?;
 
         Ok(Self {
             table,
@@ -694,6 +716,14 @@ impl<FE, T, S: Clone> Clone for SparseCow<FE, T, S> {
 }
 
 impl<FE, T, S> SparseCow<FE, T, S> {
+    pub fn create(source: S, filled: SparseTable<FE, T>, zeros: SparseTable<FE, T>) -> Self {
+        Self {
+            source,
+            filled,
+            zeros,
+        }
+    }
+
     pub fn into_deltas(self) -> (SparseTable<FE, T>, SparseTable<FE, T>) {
         (self.filled, self.zeros)
     }
