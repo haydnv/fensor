@@ -801,19 +801,37 @@ where
 }
 
 #[async_trait]
-impl<FE, T> DenseWrite for DenseCow<FE, DenseFile<FE, T>>
+impl<FE, S> DenseWrite for DenseCow<FE, S>
 where
-    FE: AsType<Buffer<T>> + FileLoad,
-    T: CDatatype + DType + 'static,
-    Buffer<T>: de::FromStream<Context = ()>,
+    FE: AsType<Buffer<S::DType>> + FileLoad + Send + Sync + 'static,
+    S: DenseInstance + Clone,
+    Array<S::DType>: From<S::Block>,
+    Buffer<S::DType>: de::FromStream<Context = ()>,
 {
-    type BlockWrite = ArrayBase<FileWriteGuardOwned<FE, Buffer<T>>>;
+    type BlockWrite = ArrayBase<FileWriteGuardOwned<FE, Buffer<S::DType>>>;
 
     async fn write_block(&self, block_id: u64) -> Result<Self::BlockWrite, Error> {
-        let buffer = self.write_buffer(block_id).await?;
+        let mut dir = self.dir.write().await;
+
+        let buffer = if let Some(buffer) = dir.get_file(&block_id) {
+            buffer.write_owned().await
+        } else {
+            let block = self.source.read_block(block_id).await?;
+
+            let context = ha_ndarray::Context::default()?;
+            let queue = ha_ndarray::Queue::new(context, block.size())?;
+            let buffer = block.read(&queue)?.into_buffer()?;
+
+            let type_size = S::DType::dtype().size();
+            let buffer_data_size = type_size * buffer.len();
+            let buffer = dir.create_file(block_id.to_string(), buffer, buffer_data_size)?;
+
+            buffer.into_write().await
+        }?;
+
         let block_axis = block_axis_for(self.shape(), self.block_size());
         let block_shape = block_shape_for(block_axis, self.shape(), buffer.len());
-        ArrayBase::<FileWriteGuardOwned<FE, Buffer<T>>>::new(block_shape, buffer)
+        ArrayBase::<FileWriteGuardOwned<FE, Buffer<S::DType>>>::new(block_shape, buffer)
             .map_err(Error::from)
     }
 
