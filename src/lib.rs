@@ -5,7 +5,7 @@ use freqfs::FileLoad;
 use number_general::{DType, Number, NumberInstance, NumberType};
 use safecast::{AsType, CastInto};
 
-pub use dense::{DenseAccess, DenseFile, DenseSlice, DenseTensor};
+pub use dense::{DenseAccess, DenseCow, DenseFile, DenseSlice, DenseTensor};
 pub use ha_ndarray::{Buffer, CDatatype};
 pub use shape::{AxisRange, Range, Shape};
 pub use sparse::{Node, SparseAccess, SparseSlice, SparseTable, SparseTensor};
