@@ -67,6 +67,37 @@ pub trait SparseWrite<'a>: SparseInstance {
 
 #[async_trait]
 pub trait SparseWriteGuard<T: CDatatype + DType>: Send + Sync {
+    async fn merge<FE, O>(&mut self, other: SparseCow<FE, T, O>) -> Result<(), Error>
+    where
+        FE: AsType<Node> + Send + Sync + 'static,
+        O: Send,
+        Number: CastInto<T>,
+    {
+        let mut zeros = other
+            .zeros
+            .table
+            .rows(b_table::Range::default(), &[], false)
+            .await?;
+
+        while let Some(row) = zeros.try_next().await? {
+            let (coord, zero) = unwrap_row(row);
+            self.write_value(coord, zero).await?;
+        }
+
+        let mut filled = other
+            .filled
+            .table
+            .rows(b_table::Range::default(), &[], false)
+            .await?;
+
+        while let Some(row) = filled.try_next().await? {
+            let (coord, value) = unwrap_row(row);
+            self.write_value(coord, value).await?;
+        }
+
+        Ok(())
+    }
+
     async fn write_value(&mut self, coord: Coord, value: T) -> Result<(), Error>;
 }
 
