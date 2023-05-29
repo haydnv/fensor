@@ -6,8 +6,8 @@ use number_general::{DType, Number, NumberInstance, NumberType};
 use safecast::{AsType, CastInto};
 
 pub use dense::{
-    DenseAccess, DenseCow, DenseFile, DenseSlice, DenseTensor, DenseWrite, DenseWriteGuard,
-    DenseWriteLock,
+    DenseAccess, DenseCow, DenseFile, DenseInstance, DenseSlice, DenseTensor, DenseWrite,
+    DenseWriteGuard, DenseWriteLock,
 };
 pub use ha_ndarray::{Buffer, CDatatype};
 pub use shape::{AxisRange, Range, Shape};

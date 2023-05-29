@@ -32,6 +32,20 @@ pub trait DenseInstance: TensorInstance + fmt::Debug + Send + Sync + 'static {
     async fn read_block(&self, block_id: u64) -> Result<Self::Block, Error>;
 
     async fn read_blocks(self) -> Result<BlockStream<Self::Block>, Error>;
+
+    async fn read_value(&self, coord: Coord) -> Result<Self::DType, Error> {
+        self.shape().validate_coord(&coord)?;
+
+        let offset = offset_of(coord, self.shape());
+        let block_id = offset / self.block_size() as u64;
+        let block_offset = (offset % self.block_size() as u64) as usize;
+
+        let block = self.read_block(block_id).await?;
+        let context = ha_ndarray::Context::default()?;
+        let queue = ha_ndarray::Queue::new(context, self.block_size())?;
+        let buffer = block.read(&queue)?;
+        Ok(buffer.to_slice()?.as_ref()[block_offset])
+    }
 }
 
 #[async_trait]
@@ -849,6 +863,18 @@ where
 
     async fn write(&'a self) -> Self::WriteGuard {
         DenseCowWriteGuard { cow: self }
+    }
+}
+
+impl<'a, FE, S, T> From<DenseCow<FE, S>> for DenseAccess<FE, T>
+where
+    DenseAccess<FE, T>: From<S>,
+{
+    fn from(cow: DenseCow<FE, S>) -> Self {
+        Self::Cow(Box::new(DenseCow {
+            source: cow.source.into(),
+            dir: cow.dir,
+        }))
     }
 }
 
