@@ -86,6 +86,8 @@ pub trait DenseWriteLock<'a>: DenseInstance {
 pub trait DenseWriteGuard<T>: Send + Sync {
     async fn overwrite<O: DenseInstance<DType = T>>(&self, other: O) -> Result<(), Error>;
 
+    async fn overwrite_value(&self, value: T) -> Result<(), Error>;
+
     async fn write_value(&self, coord: Coord, value: T) -> Result<(), Error>;
 }
 
@@ -580,6 +582,19 @@ where
             .await
     }
 
+    async fn overwrite_value(&self, value: T) -> Result<(), Error> {
+        let num_blocks = div_ceil(self.shape.size(), self.block_size as u64);
+
+        stream::iter(0..num_blocks)
+            .map(|block_id| async move {
+                let mut block = self.dir.write_file(&block_id).await?;
+                block.write_value(value).map_err(Error::from)
+            })
+            .buffered(num_cpus::get())
+            .try_fold((), |(), _| futures::future::ready(Ok(())))
+            .await
+    }
+
     async fn write_value(&self, coord: Coord, value: T) -> Result<(), Error> {
         self.shape.validate_coord(&coord)?;
 
@@ -587,7 +602,7 @@ where
         let block_id = offset / self.block_size as u64;
 
         let mut block = self.dir.write_file(&block_id).await?;
-        block.write_value((offset % self.block_size as u64) as usize, value)?;
+        block.write_value_at((offset % self.block_size as u64) as usize, value)?;
 
         Ok(())
     }
@@ -724,6 +739,18 @@ impl<FE, S: Clone> Clone for DenseCow<FE, S> {
             source: self.source.clone(),
             dir: self.dir.clone(),
         }
+    }
+}
+
+impl<FE, S> DenseCow<FE, S>
+where
+    FE: AsType<Buffer<S::DType>> + FileLoad + Send + Sync + 'static,
+    S: DenseInstance + Clone,
+    Array<S::DType>: From<S::Block>,
+    Buffer<S::DType>: de::FromStream<Context = ()>,
+{
+    pub fn create(source: S, dir: DirLock<FE>) -> Self {
+        Self { source, dir }
     }
 }
 
@@ -915,6 +942,13 @@ where
             .await
     }
 
+    async fn overwrite_value(&self, value: S::DType) -> Result<(), Error> {
+        let dest = self.cow.clone().write_blocks().await?;
+        dest.map_ok(|mut block| block.write_value(value))
+            .try_fold((), |(), _| futures::future::ready(Ok(())))
+            .await
+    }
+
     async fn write_value(&self, coord: Coord, value: S::DType) -> Result<(), Error> {
         self.cow.shape().validate_coord(&coord)?;
 
@@ -924,7 +958,7 @@ where
         let mut buffer = self.cow.write_buffer(block_id).await?;
 
         buffer
-            .write_value(block_offset as usize, value)
+            .write_value_at(block_offset as usize, value)
             .map_err(Error::from)
     }
 }
@@ -1394,6 +1428,13 @@ where
                 let source = source?;
                 dest.write(&source).map_err(Error::from)
             })
+            .try_fold((), |(), _| futures::future::ready(Ok(())))
+            .await
+    }
+
+    async fn overwrite_value(&self, value: S::DType) -> Result<(), Error> {
+        let dest = self.dest.clone().write_blocks().await?;
+        dest.map_ok(|mut block| block.write_value(value))
             .try_fold((), |(), _| futures::future::ready(Ok(())))
             .await
     }
