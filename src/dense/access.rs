@@ -545,6 +545,35 @@ pub struct DenseFileWriteGuard<'a, FE> {
     shape: &'a Shape,
 }
 
+impl<'a, FE> DenseFileWriteGuard<'a, FE> {
+    pub async fn merge<T>(&self, other: DirLock<FE>) -> Result<(), Error>
+    where
+        FE: FileLoad + AsType<Buffer<T>>,
+        T: CDatatype + DType + 'static,
+        Buffer<T>: de::FromStream<Context = ()>,
+    {
+        let num_blocks = div_ceil(self.shape.size(), self.block_size as u64);
+        stream::iter(0..num_blocks)
+            .map(move |block_id| {
+                let that = other.clone();
+
+                async move {
+                    let that = that.read().await;
+                    if that.contains(&block_id) {
+                        let mut this = self.dir.write_file(&block_id).await?;
+                        let that = that.read_file(&block_id).await?;
+                        this.write(&*that).map_err(Error::from)
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .buffer_unordered(num_cpus::get())
+            .try_fold((), |(), _| futures::future::ready(Ok(())))
+            .await
+    }
+}
+
 #[async_trait]
 impl<'a, FE, T> DenseWriteGuard<T> for DenseFileWriteGuard<'a, FE>
 where

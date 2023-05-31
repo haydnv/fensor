@@ -69,7 +69,11 @@ pub trait SparseWrite<'a>: SparseInstance {
 
 #[async_trait]
 pub trait SparseWriteGuard<T: CDatatype + DType>: Send + Sync {
-    async fn merge<FE>(&mut self, filled: SparseTable<FE, T>, zeros: SparseTable<FE, T>) -> Result<(), Error>
+    async fn merge<FE>(
+        &mut self,
+        filled: SparseTable<FE, T>,
+        zeros: SparseTable<FE, T>,
+    ) -> Result<(), Error>
     where
         FE: AsType<Node> + Send + Sync + 'static,
         Number: CastInto<T>,
