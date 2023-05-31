@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use b_table::collate::{Collate, Collator, Overlap, OverlapsRange, OverlapsValue};
 use destream::{de, en};
 use futures::TryFutureExt;
+use itertools::{Itertools, MultiProduct};
 
 use super::{Coord, Error};
 
@@ -218,6 +219,15 @@ impl Range {
             .map(|dim| AxisRange::In(0..dim, 1))
             .collect::<Vec<AxisRange>>()
             .into()
+    }
+
+    /// Return an iterator over all the [`Coord`]s within this `Range`.
+    pub fn affected(&self) -> MultiProduct<AxisRangeIter> {
+        self.axes
+            .iter()
+            .cloned()
+            .map(|axis_range| axis_range.into_iter())
+            .multi_cartesian_product()
     }
 
     /// Return `true` if this `range` contain the given coordinate.
