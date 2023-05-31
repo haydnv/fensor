@@ -12,8 +12,8 @@ pub use dense::{
 pub use ha_ndarray::{Buffer, CDatatype};
 pub use shape::{AxisRange, Range, Shape};
 pub use sparse::{
-    Node, SparseAccess, SparseCow, SparseSlice, SparseTable, SparseTensor, SparseWrite,
-    SparseWriteGuard,
+    Node, SparseAccess, SparseCow, SparseInstance, SparseSlice, SparseTable, SparseTensor,
+    SparseWrite, SparseWriteGuard,
 };
 
 pub mod dense;

@@ -18,8 +18,8 @@ use rayon::prelude::*;
 use safecast::{AsType, CastInto};
 
 use crate::{
-    strides_for, validate_order, validate_transpose, Axes, AxisRange, Coord, Error, Range, Shape,
-    Strides, TensorInstance,
+    offset_of, strides_for, validate_order, validate_transpose, Axes, AxisRange, Coord, Error,
+    Range, Shape, Strides, TensorInstance,
 };
 
 use super::schema::{IndexSchema, Schema};
@@ -56,6 +56,8 @@ pub trait SparseInstance: TensorInstance + fmt::Debug {
             .map_ok(|elements| stream::FilledAt::new(elements, axes, ndim))
             .await
     }
+
+    async fn read_value(&self, coord: Coord) -> Result<Self::DType, Error>;
 }
 
 #[async_trait]
@@ -228,6 +230,10 @@ where
     async fn elements(self, range: Range, order: Axes) -> Result<Elements<Self::DType>, Error> {
         array_dispatch!(self, this, this.elements(range, order).await)
     }
+
+    async fn read_value(&self, coord: Coord) -> Result<Self::DType, Error> {
+        array_dispatch!(self, this, this.read_value(coord).await)
+    }
 }
 
 impl<FE, T> fmt::Debug for SparseAccess<FE, T> {
@@ -324,6 +330,19 @@ where
         let rows = self.table.rows(range, &order, false).await?;
         let elements = rows.map_ok(|row| unwrap_row(row)).map_err(Error::from);
         Ok(Box::pin(elements))
+    }
+
+    async fn read_value(&self, coord: Coord) -> Result<Self::DType, Error> {
+        self.shape().validate_coord(&coord)?;
+
+        let key = coord.into_iter().map(Number::from).collect();
+        let table = self.table.read().await;
+        if let Some(mut row) = table.get(&key).await? {
+            let value = row.pop().expect("value");
+            Ok(value.cast_into())
+        } else {
+            Ok(T::zero())
+        }
     }
 }
 
@@ -518,6 +537,14 @@ where
 
         Ok(Box::pin(elements))
     }
+
+    async fn read_value(&self, mut coord: Coord) -> Result<Self::DType, Error> {
+        while coord.len() > self.inner.ndim() {
+            coord.remove(0);
+        }
+
+        self.inner.read_value(coord).await
+    }
 }
 
 impl<FE, T> From<SparseBroadcast<FE, T>> for SparseAccess<FE, T> {
@@ -711,6 +738,12 @@ impl<S: SparseInstance + Clone> SparseInstance for SparseBroadcastAxis<S> {
             Ok(Box::pin(elements))
         }
     }
+
+    async fn read_value(&self, mut coord: Coord) -> Result<Self::DType, Error> {
+        self.shape.validate_coord(&coord)?;
+        coord[self.axis] = 0;
+        self.source.read_value(coord).await
+    }
 }
 
 impl<FE, T, S: Into<SparseAccess<FE, T>>> From<SparseBroadcastAxis<S>> for SparseAccess<FE, T> {
@@ -851,6 +884,29 @@ where
             .try_flatten();
 
         Ok(Box::pin(elements))
+    }
+
+    async fn read_value(&self, coord: Coord) -> Result<Self::DType, Error> {
+        self.shape().validate_coord(&coord)?;
+
+        let key = coord.iter().copied().map(Number::from).collect();
+
+        {
+            let zeros = self.zeros.table.read().await;
+            if zeros.contains(&key).await? {
+                return Ok(Self::DType::zero());
+            }
+        }
+
+        {
+            let filled = self.filled.table.read().await;
+            if let Some(mut row) = filled.get(&key).await? {
+                let value = row.pop().expect("value");
+                return Ok(value.cast_into());
+            }
+        }
+
+        self.source.read_value(coord).await
     }
 }
 
@@ -1006,6 +1062,16 @@ impl<S: SparseInstance> SparseInstance for SparseExpand<S> {
 
         Ok(Box::pin(elements))
     }
+
+    async fn read_value(&self, mut coord: Coord) -> Result<Self::DType, Error> {
+        self.shape.validate_coord(&coord)?;
+
+        for x in self.axes.iter().rev() {
+            coord.remove(*x);
+        }
+
+        self.source.read_value(coord).await
+    }
 }
 
 impl<FE, T, S: Into<SparseAccess<FE, T>>> From<SparseExpand<S>> for SparseAccess<FE, T> {
@@ -1159,6 +1225,20 @@ impl<S: SparseInstance> SparseInstance for SparseReshape<S> {
             .try_flatten();
 
         Ok(Box::pin(elements))
+    }
+
+    async fn read_value(&self, coord: Coord) -> Result<Self::DType, Error> {
+        self.shape.validate_coord(&coord)?;
+        let offset = offset_of(coord, &self.shape);
+        let source_coord = self
+            .source_strides
+            .iter()
+            .copied()
+            .zip(self.source.shape().iter().copied())
+            .map(|(stride, dim)| (offset / stride) % dim)
+            .collect();
+
+        self.source.read_value(source_coord).await
     }
 }
 
@@ -1355,6 +1435,12 @@ where
 
         self.source.elements(source_range, source_order).await
     }
+
+    async fn read_value(&self, coord: Coord) -> Result<Self::DType, Error> {
+        self.shape.validate_coord(&coord)?;
+        let source_coord = self.range.invert_coord(coord)?;
+        self.source.read_value(source_coord).await
+    }
 }
 
 #[async_trait]
@@ -1513,6 +1599,17 @@ where
             .try_flatten();
 
         Ok(Box::pin(elements))
+    }
+
+    async fn read_value(&self, coord: Coord) -> Result<Self::DType, Error> {
+        self.shape.validate_coord(&coord)?;
+
+        let mut source_coord = vec![0; coord.len()];
+        for (i, x) in self.permutation.iter().copied().enumerate() {
+            source_coord[x] = coord[i];
+        }
+
+        self.source.read_value(source_coord).await
     }
 }
 
