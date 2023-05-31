@@ -872,6 +872,19 @@ where
     }
 }
 
+impl<FE, T, S> From<SparseCow<FE, T, S>> for SparseAccess<FE, T>
+where
+    S: Into<SparseAccess<FE, T>>,
+{
+    fn from(cow: SparseCow<FE, T, S>) -> Self {
+        SparseAccess::Cow(Box::new(SparseCow {
+            source: cow.source.into(),
+            filled: cow.filled,
+            zeros: cow.zeros,
+        }))
+    }
+}
+
 impl<FE, T, S: fmt::Debug> fmt::Debug for SparseCow<FE, T, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "copy-on-write view of {:?}", self.source)
