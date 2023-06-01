@@ -1,3 +1,5 @@
+pub extern crate ha_ndarray;
+
 use std::fmt;
 
 use destream::de;
